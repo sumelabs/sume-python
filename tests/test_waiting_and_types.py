@@ -141,3 +141,43 @@ def test_a_notebook_shows_the_image(client: sume.Client, api: MockApi) -> None:
     image = client.run("gpt-image-2", "a kite")
     html = image._repr_html_()
     assert f'<img src="{image.url}"' in html and "gpt-image-2" in html and "$0.0077" in html
+
+
+def test_an_empty_balance_says_top_up_not_job_failed(client: sume.Client, api: MockApi) -> None:
+    api.balance_usd = 0
+    with pytest.raises(sume.InsufficientFundsError, match="Top up at"):
+        client.run("gpt-image-2", "a kite")
+
+
+def test_run_names_the_timeout_it_was_given(client: sume.Client, api: MockApi) -> None:
+    api.outcome = "running"
+    with pytest.raises(sume.WaitTimeoutError, match="after 7 s"):
+        client.run("gpt-image-2", "a kite", timeout=7)
+
+
+def test_submit_can_fail_fast_when_the_account_is_full(client: sume.Client, api: MockApi) -> None:
+    api.slots_busy = 5
+    with pytest.raises(sume.RateLimitError):
+        client.submit("gpt-image-2", "a kite", slot_wait=0)
+    assert len(api.calls("POST", "/v1/image-router/generate")) == 1
+
+
+def test_data_urls_upload_http_is_refused_and_files_upload_once(
+    client: sume.Client, api: MockApi, tmp_path: Path
+) -> None:
+    import base64
+
+    (tmp_path / "photo.png").write_bytes(PNG)
+    data_url = "data:image/png;base64," + base64.b64encode(PNG).decode()
+    client.run("gpt-image-2", "a kite", image=[data_url, "photo.png", (tmp_path / "photo.png").as_uri()])
+    [body] = [json.loads(r.content) for r in api.calls("POST", "/v1/image-router/generate")]
+    assert all(u.startswith("https://media.test/assets/") for u in body["image_urls"])
+    assert len(api.calls("POST", "/v1/assets/upload-url")) == 1  # the same bytes, uploaded once
+    with pytest.raises(sume.InvalidRequestError, match="https media URLs only"):
+        client.run("gpt-image-2", "a kite", image="http://example.com/a.png")
+
+
+def test_metadata_is_never_mistaken_for_a_file(client: sume.Client, api: MockApi) -> None:
+    client.run("gpt-image-2", "a kite", metadata={"source_url": {"url": "notes"}})
+    [body] = [json.loads(r.content) for r in api.calls("POST", "/v1/image-router/generate")]
+    assert body["metadata"] == {"source_url": {"url": "notes"}}

@@ -75,7 +75,9 @@ class _Base:
             resolve_base_url(base_url)  # refuse a bad URL at construction, not at the first call
         self._explicit_base = base_url
         self._explicit_key = api_key
-        self._extra_headers = {k.lower(): v for k, v in (headers or {}).items()}
+        # The client sets these itself, per call; a stray Idempotency-Key on every call would be wrong.
+        reserved = {"authorization", "idempotency-key", "content-type", "content-length", "host"}
+        self._extra_headers = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in reserved}
         self.timeout = timeout
         self.max_retries = max_retries
 

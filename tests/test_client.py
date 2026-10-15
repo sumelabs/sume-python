@@ -170,8 +170,7 @@ def test_submit_status_wait_cancel_events(client: sume.Client, api: MockApi) -> 
     assert queued.cancel() is True
     with pytest.raises(sume.JobFailedError, match="was canceled"):
         queued.wait()
-    with pytest.raises(sume.InvalidRequestError, match="Generation has started"):
-        client.cancel(job.id)
+    assert client.cancel(job.id) is False  # it already ran: too late to cancel
     assert [j.id for j in client.list_jobs()][:2] == [queued.id, job.id]
 
 

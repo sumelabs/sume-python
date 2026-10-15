@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import logging
 import os
 import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Mapping, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, Mapping, Optional, Union
 from urllib.parse import quote
 
 import httpx
 from typing_extensions import Unpack
 
 from . import _flow
-from ._errors import APIConnectionError, APIError, InvalidRequestError, NotFoundError, RateLimitError, SumeError
+from ._errors import (
+    APIConnectionError,
+    APIError,
+    InvalidRequestError,
+    NotFoundError,
+    RateLimitError,
+    SumeError,
+    WaitTimeoutError,
+)
 from ._files import FileInput, plan_paths, read_payload
 from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import AsyncTransport
@@ -25,15 +35,16 @@ from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, f
 
 logger = logging.getLogger("sume")
 
-AsyncStatusCallback = Callable[[Status], Union[Awaitable[None], None]]
-AsyncEventCallback = Callable[[Event], Union[Awaitable[None], None]]
-AsyncSubmitCallback = Callable[["AsyncJob"], Union[Awaitable[None], None]]
+AsyncStatusCallback = Callable[[Status], object]
+AsyncEventCallback = Callable[[Event], object]
+AsyncSubmitCallback = Callable[["AsyncJob"], object]
+"""Callbacks may be plain functions or coroutine functions; what they return is ignored unless awaitable."""
 Budget = Union[float, Decimal, str]
 
 
-async def _call(callback: Callable[[Any], Union[Awaitable[None], None]], value: Any) -> None:
+async def _call(callback: Callable[[Any], object], value: Any) -> None:
     outcome = callback(value)
-    if asyncio.iscoroutine(outcome):
+    if inspect.isawaitable(outcome):
         await outcome
 
 
@@ -149,7 +160,7 @@ class AsyncJob:
         first_delay: float = 0.0,
     ) -> None:
         self.id = job_id
-        self.model = model
+        self.model: str | None = model
         self.idempotency_key = idempotency_key
         self.replayed = replayed
         self.usd = usd
@@ -277,6 +288,7 @@ class AsyncClient:
             headers=headers,
         )
         self._models: dict[str, Model] = {}
+        self._uploaded: dict[str, str] = {}
 
     @property
     def base_url(self) -> str:
@@ -349,6 +361,11 @@ class AsyncClient:
 
     async def upload(self, file: FileInput, *, content_type: str | None = None) -> str:
         payload = read_payload(file, content_type)
+        # The same bytes upload once per client, so a retry with the same idempotency key sends the
+        # same request (and gets its job back), and a batch over one photo uploads it once.
+        cache_key = hashlib.sha256(payload.data).hexdigest() + payload.content_type
+        if cache_key in self._uploaded:
+            return self._uploaded[cache_key]
         target = (
             await self._transport.request(
                 "POST",
@@ -374,6 +391,9 @@ class AsyncClient:
         ).data["asset"]
         if not asset.get("url"):
             raise SumeError(f"Sume stored {payload.filename} but returned no URL for it.", code="upload_incomplete")
+        if len(self._uploaded) >= 256:
+            self._uploaded.pop(next(iter(self._uploaded)))
+        self._uploaded[cache_key] = str(asset["url"])
         return str(asset["url"])
 
     async def submit(
@@ -384,6 +404,7 @@ class AsyncClient:
         *,
         max_usd: Budget | None = None,
         idempotency_key: str | None = None,
+        slot_wait: float = _flow.SLOT_WAIT,
         input: Optional[Mapping[str, Any]] = None,
         **inputs: Unpack[Inputs],
     ) -> AsyncJob:
@@ -395,7 +416,7 @@ class AsyncClient:
             max_usd=max_usd,
             idempotency_key=idempotency_key,
             price_it=False,
-            slot_wait=_flow.SLOT_WAIT,
+            deadline=time.monotonic() + slot_wait,
         )
 
     async def run(
@@ -423,14 +444,18 @@ class AsyncClient:
             max_usd=max_usd,
             idempotency_key=idempotency_key,
             price_it=True,
-            slot_wait=timeout,
+            deadline=started + timeout,
         )
         if on_submit is not None:
             await _call(on_submit, job)
-        remaining = max(timeout - (time.monotonic() - started), 0.001)
-        return await job.wait(
-            timeout=remaining, on_status=on_status, on_event=on_event, cancel_on_timeout=cancel_on_timeout
-        )
+        remaining = max(started + timeout - time.monotonic(), 0.001)
+        try:
+            return await job.wait(
+                timeout=remaining, on_status=on_status, on_event=on_event, cancel_on_timeout=cancel_on_timeout
+            )
+        except WaitTimeoutError as error:
+            # Name the timeout the caller set, not what was left of it after the submit.
+            raise _flow.timeout_error(job.id, timeout, canceled=error.code == "wait_timeout_canceled") from None
 
     async def _submit(
         self,
@@ -441,7 +466,7 @@ class AsyncClient:
         max_usd: Budget | None,
         idempotency_key: str | None,
         price_it: bool,
-        slot_wait: float,
+        deadline: float,
     ) -> AsyncJob:
         kind = await self._kind(model)
         body = build_body(model, kind, take_prompt(prompt, fields), fields)
@@ -459,7 +484,7 @@ class AsyncClient:
             urls = [await self.upload(value) for _, value in upload_slots(body)]
             body = with_uploads(body, urls)
             key = idempotency_key or str(uuid.uuid4())
-            data = await self._generate(model, kind, body, key, slot_wait)
+            data = await self._generate(model, kind, body, key, deadline)
             usd: str | None = None
             if pricing is not None:
                 try:
@@ -467,8 +492,11 @@ class AsyncClient:
                 except Exception:
                     usd = None
         finally:
-            if pricing is not None and not pricing.done():
-                pricing.cancel()
+            if pricing is not None:
+                if not pricing.done():
+                    pricing.cancel()
+                elif not pricing.cancelled():
+                    pricing.exception()
         job = data["job"]
         return AsyncJob(
             self,
@@ -480,8 +508,7 @@ class AsyncClient:
             first_delay=_flow.first_delay(data),
         )
 
-    async def _generate(self, model: str, kind: str, body: Mapping[str, Any], key: str, slot_wait: float) -> Any:
-        deadline = time.monotonic() + slot_wait
+    async def _generate(self, model: str, kind: str, body: Mapping[str, Any], key: str, deadline: float) -> Any:
         attempt = 0
         while True:
             try:
@@ -534,7 +561,12 @@ class AsyncClient:
         return await AsyncJob(self, job_id).wait(timeout=timeout, on_status=on_status, on_event=on_event)
 
     async def cancel(self, job_id: str) -> bool:
-        data = (await self._transport.request("POST", f"/v1/jobs/{quote(job_id)}/cancel", retry=True)).data
+        try:
+            data = (await self._transport.request("POST", f"/v1/jobs/{quote(job_id)}/cancel", retry=True)).data
+        except InvalidRequestError as error:
+            if error.code in _flow.TOO_LATE_TO_CANCEL:
+                return False
+            raise
         return bool(data.get("canceled"))
 
     async def list_jobs(self, *, limit: int = 20, status: str | None = None) -> list[JobInfo]:

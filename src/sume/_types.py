@@ -275,7 +275,12 @@ class JobInfo:
 
         start = parse(self.started_at) or parse(self.created_at)
         end = parse(self.completed_at)
-        return round((end - start).total_seconds(), 3) if start and end else None
+        if not (start and end):
+            return None
+        try:
+            return round((end - start).total_seconds(), 3)
+        except TypeError:  # one timestamp with a zone, one without
+            return None
 
     @property
     def urls(self) -> list[str]:

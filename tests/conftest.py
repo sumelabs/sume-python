@@ -177,7 +177,15 @@ class MockApi:
     def generate(self, request: httpx.Request, path: str, body: dict[str, Any]) -> httpx.Response:
         if self.slots_busy > 0:
             self.slots_busy -= 1
-            return self.error(429, "concurrency_limit_reached", "Too many jobs in flight.", retryable=True)
+            # As the real API answers an account at its cap: 400, with the refused job (failed) in details.
+            refused = {"id": f"job_refused_{self.slots_busy}", "status": "failed", "error": {"code": "queue_full"}}
+            return self.error(
+                400,
+                "concurrency_limit_reached",
+                "Too many jobs in flight.",
+                retryable=True,
+                details={"job": refused, "retry_after_seconds": 30},
+            )
         if self.reject_fields:
             return self.error(
                 400,
@@ -206,7 +214,11 @@ class MockApi:
                 402,
                 "insufficient_funds",
                 "Balance too low.",
-                details={"required_usd": f"{price:.4f}", "available_usd": "0.00"},
+                details={
+                    "required_usd": f"{price:.4f}",
+                    "available_usd": "0.00",
+                    "job": {"id": "job_refused_funds", "status": "failed", "error": {"code": "insufficient_funds"}},
+                },
             )
         job_id = f"job_{len(self.jobs) + 1:08d}-0000-0000-0000-000000000000"
         job = {

@@ -66,7 +66,7 @@ captioned = sume.run("veed-subtitles", video="clip.mp4", duration=12, captions={
 - **`max_usd`** refuses to submit a request that costs more. It raises `OverBudgetError` before anything is uploaded or charged.
 - **`timeout`** is how long `run` waits in all, in seconds: 30 minutes by default. When it passes, the job keeps running; see [Progress, long jobs and cancel](#progress-long-jobs-and-cancel).
 - **Retries never pay twice.** Every submit carries an idempotency key, and the client's retries reuse it. To retry a submit yourself, pass `idempotency_key=`.
-- **A busy account waits.** When the account already runs as many jobs as it may, `run` and `submit` wait for a free slot and submit then, instead of failing.
+- **A busy account waits.** When the account already runs as many jobs as it may, `run` and `submit` wait for a free slot and submit then, instead of failing: `run` within its `timeout`, `submit` up to 10 minutes. `submit(..., slot_wait=0)` raises `RateLimitError` at once instead.
 
 `run` returns a `Result`:
 
@@ -98,7 +98,7 @@ app.py:1: error: Unexpected keyword argument "qualty"; did you mean "quality"?  
 app.py:2: error: Argument "duration" has incompatible type "str"; expected "int"  [arg-type]
 ```
 
-- `sume.ModelId` lists every model this version knows; `sume.ImageModelId` and `sume.VideoModelId` split them by kind. A model added to the catalog later still works: `run` takes any id as a string.
+- `sume.ModelId` lists every model this version knows; `sume.ImageModelId` and `sume.VideoModelId` split them by kind. A model added to the catalog later still works: `run` takes any id as a string. A typo in a model id is caught when the call runs, with a suggestion (`Did you mean gpt-image-2?`), not by the type checker.
 - `sume.Inputs` is the `TypedDict` of request fields that `run`, `submit` and `estimate` take as keyword arguments. Values with a fixed set, like `aspect_ratio`, `resolution` and `captions["position"]`, are `Literal`s.
 - A field newer than this version goes through `input=`, as a plain dict: `sume.run("gpt-image-2", "a kite", input={"new_field": 1})`.
 - What comes back is typed too: `Result`, `Job`, `Status`, `Event`, `Model`, `Price` and `JobInfo` are classes with typed attributes, not dicts. Each of them except `Job` keeps the API's own JSON in `raw`.
@@ -153,13 +153,13 @@ sume.list_jobs(limit=10)  # newest first
 A job that has not started generating can be canceled, and it is refunded:
 
 ```python
-sume.cancel(job.id)  # True when canceled
+sume.cancel(job.id)  # True when canceled; False when it had already started or ended
 
 # Or give up on a wait, and cancel the job if it is still queued:
 sume.run("kling-3", "a red kite", duration=5, timeout=120, cancel_on_timeout=True)
 ```
 
-`wait`, `poll` and `run` read the status as often as the API asks: at most every 5 s for the first minute, every 10 s after that, and every 15 s after ten minutes. Network errors and errors on Sume's side do not end the wait. When `timeout` passes, `WaitTimeoutError` names the job, and the job keeps running (unless you passed `cancel_on_timeout=True` and it had not started). Do not submit again: a second submit is a second charge.
+`wait`, `poll` and `run` read the status as often as the API asks, but never wait longer than 5 s between reads in the first minute, 10 s after that, and 15 s after ten minutes. Network errors and errors on Sume's side do not end the wait. When `timeout` passes, `WaitTimeoutError` names the job, and the job keeps running (unless you passed `cancel_on_timeout=True` and it had not started). Do not submit again: a second submit is a second charge.
 
 ## Files
 
@@ -232,7 +232,8 @@ async def make_image(prompt: str):
 
 @app.post("/videos")
 async def start_video(prompt: str):
-    job = await client.submit("seedance-2-mini", prompt, duration=5, resolution="480p", max_usd=0.50)
+    # A busy account waits for a slot; slot_wait bounds that, so the request never hangs.
+    job = await client.submit("seedance-2-mini", prompt, duration=5, resolution="480p", max_usd=0.50, slot_wait=20)
     return {"job_id": job.id}  # video takes minutes: hand back the id, and let the page poll
 
 
@@ -294,7 +295,7 @@ except sume.InvalidRequestError as error:
 | `InvalidRequestError` | A field is missing, wrong, or not taken by this model (`field_errors` says which). `NotFoundError` covers an unknown model or job; for a model it suggests the closest id |
 | `RateLimitError` | Too many requests, or a slot did not free up within the wait |
 | `JobFailedError` | The job failed or was canceled. It is refunded; `job_id` and the reason are on the error |
-| `WaitTimeoutError` | `timeout` passed. The job is still running; `sume.result(error.job_id)` picks it up |
+| `WaitTimeoutError` | `timeout` passed. The job is still running; `sume.result(error.job_id)` picks it up. With `cancel_on_timeout=True` it was canceled and refunded instead (`code` is `wait_timeout_canceled`) |
 | `APIError`, `APIConnectionError` | A problem on Sume's side, or the network. `retryable` says whether trying again can help |
 
 Each error also has `code`, `hint`, `status`, `request_id`, `job_id` and `details`. Quote `request_id` to support. When a submit's outcome is unknown (the network dropped, or Sume answered 5xx), the error names the idempotency key in `idempotency_key` and in the `Fix:` line: pass it back to get that job instead of paying twice.
@@ -325,10 +326,11 @@ logging.getLogger("sume").setLevel(logging.DEBUG)
 # DEBUG:sume:POST /v1/image-router/generate -> 202 (request req_9c1…, attempt 1, 412 ms)
 ```
 
+The `sume` logger never prints the key or an upload URL. httpx logs every request URL at INFO, presigned upload URLs included, so keep `logging.getLogger("httpx")` at WARNING when logs are shared.
+
 | Host | What it is |
 |---|---|
 | `https://api.open.sume.com` (default) | Open's production API. Keys come from open.sume.com |
-| `https://open-api-development.up.railway.app` | Open's development API, for Sume staff. Keys come from open.dev.sume.com |
 | `https://api.sume.com` | **Not Open.** This is sume.com's own API, and Open keys do not work there |
 
 A key works only on the host it was made for. On another host it is refused as if it were wrong, and the error says so.
@@ -353,14 +355,14 @@ Module functions use a shared default client; `sume.Client` and `sume.AsyncClien
 | Call | Returns |
 |---|---|
 | `run(model, prompt=None, /, *, max_usd, timeout, idempotency_key, on_submit, on_status, on_event, cancel_on_timeout, input, **inputs)` | `Result` |
-| `submit(model, prompt=None, /, *, max_usd, idempotency_key, input, **inputs)` | `Job` |
+| `submit(model, prompt=None, /, *, max_usd, idempotency_key, slot_wait=600, input, **inputs)` | `Job` |
 | `estimate(model, prompt=None, /, *, input, **inputs)` | `Price` (`usd`, `usd_micros`, `str()` → `"$0.0060"`) |
 | `models(kind=None)`, `model(id)` | `list[Model]`, `Model` (`id`, `name`, `kind`, `price`, `price_from`, `per`, `resolutions`, `seconds`, `inputs`) |
 | `upload(file, *, content_type=None)` | the file's URL |
 | `job(id)` | `Job`, without a call |
 | `status(id)` | `Status` (`state`, `done`, `ok`, `queue_position`) |
 | `result(id, *, timeout, on_status, on_event)` | `Result`, waiting if the job is still running |
-| `cancel(id)` | `True` when canceled |
+| `cancel(id)` | `True` when canceled, `False` when too late |
 | `list_jobs(*, limit=20, status=None)` | `list[JobInfo]` |
 | `verify_webhook(body, headers, secret, *, tolerance=600)` | `bool` |
 | `job.status()`, `job.poll(*, timeout)`, `job.wait(*, timeout, on_status, on_event, cancel_on_timeout)`, `job.cancel()`, `job.events()`, `job.info()` | `Status`, an iterator of `Status`, `Result`, `bool`, `list[Event]`, `JobInfo` |

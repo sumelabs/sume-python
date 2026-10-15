@@ -129,6 +129,11 @@ def field_errors(details: Any) -> list[FieldError]:
     return out
 
 
+_ACCOUNT_CODES = frozenset(
+    {"concurrency_limit_reached", "queue_full", "insufficient_funds", "insufficient_credits", "unauthorized"}
+)
+
+
 def error_from_response(
     status: int,
     body: Mapping[str, Any],
@@ -143,6 +148,8 @@ def error_from_response(
     retryable = bool(body.get("retryable", status == 429 or status >= 500))
     request_id = body.get("request_id") or request_id
     wait = body.get("retry_after_seconds")
+    if not isinstance(wait, (int, float)) and isinstance(details, Mapping):
+        wait = details.get("retry_after_seconds")
     common: dict[str, Any] = {
         "code": code,
         "status": status,
@@ -157,8 +164,16 @@ def error_from_response(
 
     # A provider can refuse a job the moment it is submitted: the API answers
     # with the job already failed. That is a failed job (refunded), not a bad request.
+    # Refusals about the account (its job cap, its balance, its key) carry the refused
+    # job too, but they are about the account, so they get their own classes below.
     job = details.get("job") if isinstance(details, Mapping) else None
-    if isinstance(job, Mapping) and job.get("status") in ("failed", "canceled") and isinstance(job.get("id"), str):
+    about_account = code in _ACCOUNT_CODES or status in (401, 402, 403, 429)
+    if (
+        not about_account
+        and isinstance(job, Mapping)
+        and job.get("status") in ("failed", "canceled")
+        and isinstance(job.get("id"), str)
+    ):
         reason = (job.get("error") or {}).get("message") if isinstance(job.get("error"), Mapping) else None
         return JobFailedError(
             f"Job {job['id']} {job['status']}: {reason or message}",
@@ -180,7 +195,7 @@ def error_from_response(
         return AuthenticationError(message, hint=hint or _other_host_hint(base_url), **common)
     if status == 403:
         return AuthenticationError(message, hint=_other_host_hint(base_url), **common)
-    if code == "insufficient_funds" or status == 402:
+    if code in ("insufficient_funds", "insufficient_credits") or status == 402:
         need = details.get("required_usd") if isinstance(details, Mapping) else None
         have = details.get("available_usd") if isinstance(details, Mapping) else None
         amounts = (
@@ -208,6 +223,15 @@ def error_from_response(
     if code == "job_not_completed":
         return InvalidRequestError(message, hint="The job has not finished. Wait for it with result(job_id).", **common)
     if code == "idempotency_conflict":
+        existing = details.get("job_id") if isinstance(details, Mapping) else None
+        if isinstance(existing, str):
+            return InvalidRequestError(
+                message,
+                hint=f'That key already made job {existing}: get it with sume.result("{existing}"). '
+                "Use a new key only for a new job.",
+                job_id=existing,
+                **common,
+            )
         return InvalidRequestError(
             message, hint="That idempotency key belongs to a different request. Use a new key.", **common
         )

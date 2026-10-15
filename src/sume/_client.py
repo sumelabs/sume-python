@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -16,7 +17,15 @@ import httpx
 from typing_extensions import Unpack
 
 from . import _flow
-from ._errors import APIConnectionError, APIError, InvalidRequestError, NotFoundError, RateLimitError, SumeError
+from ._errors import (
+    APIConnectionError,
+    APIError,
+    InvalidRequestError,
+    NotFoundError,
+    RateLimitError,
+    SumeError,
+    WaitTimeoutError,
+)
 from ._files import FileInput, plan_paths, read_payload
 from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import SyncTransport
@@ -25,9 +34,9 @@ from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, f
 
 logger = logging.getLogger("sume")
 
-StatusCallback = Callable[[Status], None]
-EventCallback = Callable[[Event], None]
-SubmitCallback = Callable[["Job"], None]
+StatusCallback = Callable[[Status], object]
+EventCallback = Callable[[Event], object]
+SubmitCallback = Callable[["Job"], object]
 Budget = Union[float, Decimal, str]
 
 
@@ -159,7 +168,7 @@ class Job:
         first_delay: float = 0.0,
     ) -> None:
         self.id = job_id
-        self.model = model
+        self.model: str | None = model
         self.idempotency_key = idempotency_key
         self.replayed = replayed
         """True when the idempotency key matched an earlier submit: this one paid nothing."""
@@ -313,6 +322,7 @@ class Client:
             headers=headers,
         )
         self._models: dict[str, Model] = {}
+        self._uploaded: dict[str, str] = {}
 
     @property
     def base_url(self) -> str:
@@ -407,6 +417,11 @@ class Client:
         You rarely need this: ``run`` and ``submit`` upload local files themselves.
         """
         payload = read_payload(file, content_type)
+        # The same bytes upload once per client, so a retry with the same idempotency key sends the
+        # same request (and gets its job back), and a batch over one photo uploads it once.
+        cache_key = hashlib.sha256(payload.data).hexdigest() + payload.content_type
+        if cache_key in self._uploaded:
+            return self._uploaded[cache_key]
         target = self._transport.request(
             "POST",
             "/v1/assets/upload-url",
@@ -424,6 +439,9 @@ class Client:
         ).data["asset"]
         if not asset.get("url"):
             raise SumeError(f"Sume stored {payload.filename} but returned no URL for it.", code="upload_incomplete")
+        if len(self._uploaded) >= 256:
+            self._uploaded.pop(next(iter(self._uploaded)))
+        self._uploaded[cache_key] = str(asset["url"])
         return str(asset["url"])
 
     # Generation.
@@ -436,6 +454,7 @@ class Client:
         *,
         max_usd: Budget | None = None,
         idempotency_key: str | None = None,
+        slot_wait: float = _flow.SLOT_WAIT,
         input: Optional[Mapping[str, Any]] = None,
         **inputs: Unpack[Inputs],
     ) -> Job:
@@ -457,7 +476,7 @@ class Client:
             max_usd=max_usd,
             idempotency_key=idempotency_key,
             price_it=False,
-            slot_wait=_flow.SLOT_WAIT,
+            deadline=time.monotonic() + slot_wait,
         )
 
     def run(
@@ -506,12 +525,18 @@ class Client:
             max_usd=max_usd,
             idempotency_key=idempotency_key,
             price_it=True,
-            slot_wait=timeout,
+            deadline=started + timeout,
         )
         if on_submit is not None:
             on_submit(job)
-        remaining = max(timeout - (time.monotonic() - started), 0.001)
-        return job.wait(timeout=remaining, on_status=on_status, on_event=on_event, cancel_on_timeout=cancel_on_timeout)
+        remaining = max(started + timeout - time.monotonic(), 0.001)
+        try:
+            return job.wait(
+                timeout=remaining, on_status=on_status, on_event=on_event, cancel_on_timeout=cancel_on_timeout
+            )
+        except WaitTimeoutError as error:
+            # Name the timeout the caller set, not what was left of it after the submit.
+            raise _flow.timeout_error(job.id, timeout, canceled=error.code == "wait_timeout_canceled") from None
 
     def _submit(
         self,
@@ -522,7 +547,7 @@ class Client:
         max_usd: Budget | None,
         idempotency_key: str | None,
         price_it: bool,
-        slot_wait: float,
+        deadline: float,
     ) -> Job:
         kind = self._kind(model)
         body = build_body(model, kind, take_prompt(prompt, fields), fields)
@@ -539,7 +564,7 @@ class Client:
             urls = [self.upload(value) for _, value in upload_slots(body)]
             body = with_uploads(body, urls)
             key = idempotency_key or str(uuid.uuid4())
-            data = self._generate(model, kind, body, key, slot_wait)
+            data = self._generate(model, kind, body, key, deadline)
             usd: str | None = None
             if pricing is not None:
                 try:
@@ -560,8 +585,7 @@ class Client:
             first_delay=_flow.first_delay(data),
         )
 
-    def _generate(self, model: str, kind: str, body: Mapping[str, Any], key: str, slot_wait: float) -> Any:
-        deadline = time.monotonic() + slot_wait
+    def _generate(self, model: str, kind: str, body: Mapping[str, Any], key: str, deadline: float) -> Any:
         attempt = 0
         while True:
             try:
@@ -619,8 +643,14 @@ class Client:
         return Job(self, job_id).wait(timeout=timeout, on_status=on_status, on_event=on_event)
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a job that has not started generating. Returns True when it was canceled; it is refunded."""
-        data = self._transport.request("POST", f"/v1/jobs/{quote(job_id)}/cancel", retry=True).data
+        """Cancel a job that has not started generating. True when it was canceled (it is refunded);
+        False when it had already started or ended."""
+        try:
+            data = self._transport.request("POST", f"/v1/jobs/{quote(job_id)}/cancel", retry=True).data
+        except InvalidRequestError as error:
+            if error.code in _flow.TOO_LATE_TO_CANCEL:
+                return False
+            raise
         return bool(data.get("canceled"))
 
     def list_jobs(self, *, limit: int = 20, status: str | None = None) -> list[JobInfo]:

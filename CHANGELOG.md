@@ -24,6 +24,16 @@ Types for every model and field, progress callbacks, and a client that waits ins
 
 ### Changed
 
+- A full account and an empty balance now raise `RateLimitError` and `InsufficientFundsError`. The API answers both with the refused job in `details`, which 0.1.0 read as `JobFailedError`, so the slot wait never ran and the top-up hint never showed.
+- `cancel` returns `False` when the job has already started or ended, instead of raising.
+- A wait that runs out names the timeout you set. `run(timeout=)` spends one budget across the slot wait, the uploads and the wait. When `cancel_on_timeout` cancels the job, the error's code is `wait_timeout_canceled`.
+- With `max_usd=`, a request the API refuses keeps its error class and field errors.
+- `idempotency_conflict` names the job that the key already made (`error.job_id`), with the call that gets it.
+- The same bytes upload once per client. A retry with the same idempotency key then sends the same request and gets its job back, and a batch over one photo uploads it once. `data:` URLs are uploaded; `http://` media URLs are refused before anything is spent. A string counts as a path inside `frame_images` and `input_references`, never inside `metadata`.
+- `headers` drops the names the client sets itself (`authorization`, `idempotency-key`, `content-type`).
+- Callbacks may return anything.
+- `submit(..., slot_wait=)` bounds how long a busy account waits (`0` raises at once).
+- `typing.get_type_hints(sume.Inputs)` works, so pydantic and FastAPI models can use it.
 - Models this version knows skip the catalog lookup before a submit. A model that is not in the catalog still gets a "Did you mean" suggestion.
 - `Event.raw` is the event's JSON, as on every other type (`Event.data` still works).
 - The package depends on `typing-extensions` as well as `httpx`.

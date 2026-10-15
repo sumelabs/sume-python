@@ -39,6 +39,9 @@ _LIST_FIELDS = {"image_urls", "input_urls", "reference_image_urls", "reference_v
 
 SHORT_NAMES = ("image", "images", *_VIDEO_ONLY, *_IMAGE_ONLY)
 
+NESTED_MEDIA_FIELDS = ("frame_images", "input_references")
+"""Lists of ``{"type": ..., "image_url": {"url": ...}}`` entries, whose ``url`` is a media URL."""
+
 Path_ = Tuple[Union[str, int], ...]
 """Where a value sits in the body: ``("image_urls", 0)``, ``("captions", "srt")``."""
 
@@ -120,8 +123,17 @@ def _is_file_object(value: Any) -> bool:
 
 def _needs_upload(value: Any, in_media_field: bool) -> bool:
     if isinstance(value, str):
-        # A string is a file path only where a media URL belongs; elsewhere it is text.
-        return in_media_field and not is_http_url(value) and not value.startswith("data:")
+        # A string is a file only where a media URL belongs; elsewhere it is text.
+        if not in_media_field:
+            return False
+        if value[:7].lower() == "http://":
+            raise InvalidRequestError(
+                f"The API takes https media URLs only: {value[:80]}",
+                hint="Use the https address, or pass the file itself (a path or bytes) to upload it.",
+                code="invalid_input",
+            )
+        # A path, a file: URL or a data: URL; an https URL goes as it is.
+        return not is_http_url(value)
     return _is_file_object(value)
 
 
@@ -139,8 +151,13 @@ def upload_slots(body: Mapping[str, Any]) -> list[tuple[Path_, Any]]:
         if isinstance(value, Mapping):
             parent = path[-1]
             for key, item in value.items():
-                # {"image_url": {"url": ...}} inside a list like frame_images is a media URL too.
-                media = in_media_field or (key == "url" and isinstance(parent, str) and parent.endswith("_url"))
+                # {"image_url": {"url": ...}} inside frame_images or input_references is a media URL too.
+                media = in_media_field or (
+                    path[0] in NESTED_MEDIA_FIELDS
+                    and key == "url"
+                    and isinstance(parent, str)
+                    and parent.endswith("_url")
+                )
                 walk(item, (*path, key), media)
         elif isinstance(value, (list, tuple)):
             for index, item in enumerate(value):

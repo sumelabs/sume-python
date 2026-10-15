@@ -21,8 +21,30 @@ class SupportsImageSave(Protocol):
     def save(self, fp: Any, format: Any = ..., **params: Any) -> None: ...
 
 
-FileInput = Union[str, "os.PathLike[str]", bytes, bytearray, memoryview, IO[bytes], SupportsImageSave]
+FileInput = Union[str, os.PathLike[str], bytes, bytearray, memoryview, IO[bytes], SupportsImageSave]
 """Anything the client can upload: a URL (sent as is), a file path, bytes, an open binary file, or a PIL image."""
+
+
+def _data_url(value: str, content_type: str | None) -> Payload:
+    """``data:image/png;base64,...`` as bytes: the API takes https URLs only, so it is uploaded."""
+    import base64
+    from urllib.parse import unquote_to_bytes
+
+    header, _, body = value[5:].partition(",")
+    parts = header.split(";")
+    kind = content_type or parts[0] or None
+    try:
+        data = base64.b64decode(body, validate=True) if "base64" in parts[1:] else unquote_to_bytes(body)
+    except ValueError:
+        raise InvalidRequestError(
+            "The data: URL is not valid base64.", hint="Pass the file's path or bytes instead.", code="invalid_input"
+        ) from None
+    kind = kind or sniff_content_type(data)
+    if not data or not kind:
+        raise InvalidRequestError(
+            "The data: URL is empty or has no media type.", hint="Pass the file's path instead.", code="invalid_input"
+        )
+    return Payload(data=data, content_type=kind, filename="upload" + extension_for(kind, None, None))
 
 
 @dataclass(frozen=True)
@@ -35,7 +57,14 @@ class Payload:
 
 
 def read_payload(value: Any, content_type: str | None = None) -> Payload:
-    """A path, bytes, an open binary file, or a PIL image, as bytes with a media type."""
+    """A path, a ``file:`` or ``data:`` URL, bytes, an open binary file, or a PIL image, as bytes with a media type."""
+    if isinstance(value, str) and value.startswith("data:"):
+        return _data_url(value, content_type)
+    if isinstance(value, str) and value.startswith("file://"):
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+
+        value = url2pathname(urlparse(value).path)
     if isinstance(value, (str, os.PathLike)):
         path = Path(os.fspath(value)).expanduser()
         if not path.is_file():

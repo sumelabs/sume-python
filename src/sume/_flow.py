@@ -56,7 +56,7 @@ def timeout_error(job_id: str, timeout: float, *, canceled: bool = False) -> Wai
         return WaitTimeoutError(
             f"Stopped waiting after {round(timeout)} s, and canceled job {job_id} before it started. It is refunded.",
             hint="Raise timeout=, or submit when the queue is shorter.",
-            code="wait_timeout",
+            code="wait_timeout_canceled",
             job_id=job_id,
         )
     return WaitTimeoutError(
@@ -66,6 +66,9 @@ def timeout_error(job_id: str, timeout: float, *, canceled: bool = False) -> Wai
         job_id=job_id,
     )
 
+
+TOO_LATE_TO_CANCEL = frozenset({"job_generation_already_started", "job_not_cancelable"})
+"""What the API answers when a job has already started generating, or has ended."""
 
 SLOT_WAIT = 600.0
 """How long ``submit`` waits for a free slot when the account has as many jobs running as it may."""
@@ -114,18 +117,17 @@ def check_budget(price: Price, max_usd: float | Decimal | str) -> None:
 
 
 def priced(get: Callable[[], Price]) -> Price:
-    """The price, or why max_usd could not be checked (and so nothing was submitted)."""
+    """The price, or why max_usd could not be checked (and so nothing was submitted).
+
+    The error keeps its class and fields: a refused field is still an ``InvalidRequestError``.
+    """
     try:
         return get()
     except SumeError as error:
-        raise SumeError(
-            f"Could not price the request ({error.message}), so max_usd cannot be checked. Nothing was submitted.",
-            hint=error.hint,
-            code=error.code,
-            status=error.status,
-            request_id=error.request_id,
-            retryable=error.retryable,
-        ) from None
+        error.message = (
+            f"Could not price the request ({error.message}), so max_usd cannot be checked. Nothing was submitted."
+        )
+        raise
 
 
 _LISTED = {
