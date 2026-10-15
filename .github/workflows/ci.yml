@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e . ruff mypy
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          - { os: macos-latest, python: "3.10" }
+          - { os: macos-latest, python: "3.11" }
+          - { os: windows-latest, python: "3.10" }
+          - { os: windows-latest, python: "3.11" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e . pytest anyio
+      - run: python -m pytest
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build
+      - name: Install the wheel in a clean venv and import it
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp && /tmp/clean/bin/python -c "import sume; print(sume.__version__, sume.Client().base_url)"

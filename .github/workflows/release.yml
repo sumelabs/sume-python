@@ -1,0 +1,76 @@
+name: Release
+
+# Push a tag like v0.1.0. The workflow checks that the tag matches the
+# version, tests, builds the sdist and wheel, attests them, and publishes a
+# GitHub release with both (plus sume.tar.gz, a stable name for "latest").
+#
+# PyPI: the `pypi` job publishes with Trusted Publishing once a maintainer of
+# the `sume` project on PyPI adds this repository and workflow (environment
+# `pypi`) as a trusted publisher, and sets the repository variable
+# PUBLISH_TO_PYPI to `true`. Until then it is skipped.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: The tag matches the version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          code="$(python -c 'exec(open("src/sume/_version.py").read()); print(__version__)')"
+          test "$tag" = "$version" && test "$tag" = "$code" || { echo "::error::tag $tag, pyproject $version, _version.py $code"; exit 1; }
+          grep -q "## \[$tag\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no [$tag] section"; exit 1; }
+      - run: pip install -e . pytest anyio build
+      - run: python -m pytest
+      - run: python -m build
+      - name: Install the wheel in a clean venv
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp && /tmp/clean/bin/python -c "import sume; assert sume.__version__ == '${GITHUB_REF_NAME#v}'"
+      - run: cp dist/sume-*.tar.gz dist/sume.tar.gz
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+          printf '\n## Install\n\n```sh\npip install https://github.com/%s/releases/download/%s/sume.tar.gz\n```\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> notes.md
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/sume-*
+
+  pypi:
+    needs: build
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - run: rm -f dist/sume.tar.gz
+      - uses: pypa/gh-action-pypi-publish@release/v1
