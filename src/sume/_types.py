@@ -206,6 +206,24 @@ class FileInfo:
         }
 
 
+def files_html(files: Sequence[FileInfo], caption: str) -> str:
+    """The files as HTML, so a notebook shows the image or plays the video instead of printing a repr."""
+    from html import escape
+
+    parts = []
+    for file in files:
+        url = escape(file.url, quote=True)
+        if file.type == "image":
+            parts.append(f'<img src="{url}" style="max-width:100%;max-height:480px">')
+        elif file.type == "video":
+            parts.append(f'<video src="{url}" controls style="max-width:100%;max-height:480px"></video>')
+        elif file.type == "audio":
+            parts.append(f'<audio src="{url}" controls></audio>')
+        else:
+            parts.append(f'<a href="{url}">{escape(file.url)}</a>')
+    return f"<div>{''.join(parts)}<div><small>{escape(caption)}</small></div></div>"
+
+
 def final_files(artifacts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     """The files a person asked for: no intermediate stages, and no poster image beside a video."""
     finals = [a for a in artifacts if not a.get("stage")]

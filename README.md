@@ -78,6 +78,7 @@ captioned = sume.run("veed-subtitles", video="clip.mp4", duration=12, captions={
 | `result.usd` | The price in dollars, as a string like `"0.0060"` |
 | `result.job` | The job: `input`, `created_at`, `completed_at`, and `seconds` (how long it ran) |
 | `result.to_dict()` | A JSON-ready summary, to return from a web handler |
+| `result` in Jupyter | Shows the image, or plays the video, right in the notebook |
 | `result.job_id`, `result.model` | Which job made it |
 
 A video's poster frame is left out of `files`; `all_files` has every file the job made.

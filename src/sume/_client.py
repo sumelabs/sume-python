@@ -21,7 +21,7 @@ from ._files import FileInput, plan_paths, read_payload
 from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import SyncTransport
 from ._inputs import build_body, router_for, take_prompt, upload_slots, with_uploads
-from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, final_files
+from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, files_html, final_files
 
 logger = logging.getLogger("sume")
 
@@ -133,6 +133,11 @@ class Result:
             "files": [f.to_dict() for f in self.files],
             "seconds": self.job.seconds if self.job else None,
         }
+
+    def _repr_html_(self) -> str:
+        """In a notebook, a result shows its image or plays its video."""
+        usd = f" · ${self.usd}" if self.usd else ""
+        return files_html(self.files, f"{self.model} · {self.job_id}{usd}")
 
     def __repr__(self) -> str:
         usd = f", usd={self.usd!r}" if self.usd else ""

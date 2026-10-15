@@ -17,6 +17,7 @@ Types for every model and field, progress callbacks, and a client that waits ins
 - `error.field_errors`: each field the API refused, as `FieldError(path, message)`. The `Fix:` line lists the values the model takes for those fields, from the catalog (`gpt-image-2 takes aspect_ratio auto, 1:1, 16:9, …`).
 - Files are uploaded wherever they sit in the inputs, nested ones included (`frame_images`, `input_references`). A path string counts as a file where a media URL belongs, and nowhere else.
 - `result.job` (input, timing, and `seconds`) and `result.to_dict()`, a JSON-ready summary for web handlers. `JobInfo.started_at` and `JobInfo.seconds`.
+- In Jupyter, a `Result` shows its image, or plays its video, in the notebook.
 - `headers=` on `Client` and `AsyncClient`: extra headers for API calls, never sent to storage or media hosts.
 - Debug logging on the `sume` logger: one line per API call with the status, request id, attempt and time.
 - The README covers types, progress, cancel, nested uploads, FastAPI and Flask, logging, and a table for people coming from fal or Higgsfield. CI type-checks every example in it.

@@ -135,3 +135,9 @@ def test_the_prompt_by_position_wins_over_prompt_by_name(client: sume.Client, ap
     client.run("gpt-image-2", prompt="only by name")
     bodies = [json.loads(r.content) for r in api.calls("POST", "/v1/image-router/generate")]
     assert [b["prompt"] for b in bodies] == ["by position", "only by name"]
+
+
+def test_a_notebook_shows_the_image(client: sume.Client, api: MockApi) -> None:
+    image = client.run("gpt-image-2", "a kite")
+    html = image._repr_html_()
+    assert f'<img src="{image.url}"' in html and "gpt-image-2" in html and "$0.0077" in html
