@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ._constants import BILLING_URL, DEFAULT_BASE_URL, KEYS_URL, WRONG_HOST
+from ._types import FieldError
 
 
 class SumeError(Exception):
@@ -36,6 +37,7 @@ class SumeError(Exception):
         job_id: str | None = None,
         idempotency_key: str | None = None,
         retry_after: float | None = None,
+        field_errors: list[FieldError] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -49,11 +51,15 @@ class SumeError(Exception):
         self.idempotency_key = idempotency_key
         self.retry_after = retry_after
         """Seconds the API asked to wait before retrying, when it said."""
+        self.field_errors: list[FieldError] = field_errors or []
+        """The fields the API refused, one by one, for showing next to a form."""
 
     def __str__(self) -> str:
         line = self.message
         if self.request_id:
             line += f" (request {self.request_id})"
+        for field in self.field_errors:
+            line += f"\n  - {field}"
         if self.hint:
             line += f"\nFix: {self.hint}"
         return line
@@ -110,17 +116,17 @@ def _other_host_hint(base_url: str) -> str:
     return f"The key is wrong or revoked. Make a new one at {KEYS_URL}."
 
 
-def field_errors(details: Any) -> list[str]:
-    """``details.errors[]`` as ``field: message`` lines."""
+def field_errors(details: Any) -> list[FieldError]:
+    """``details.errors[]`` as ``FieldError``s."""
     errors = details.get("errors") if isinstance(details, Mapping) else None
     if not isinstance(errors, list):
         return []
-    lines = []
+    out = []
     for entry in errors:
         if isinstance(entry, Mapping) and isinstance(entry.get("message"), str):
             path = entry.get("path")
-            lines.append(f"{path}: {entry['message']}" if isinstance(path, str) and path else entry["message"])
-    return lines
+            out.append(FieldError(path=path if isinstance(path, str) else "", message=entry["message"]))
+    return out
 
 
 def error_from_response(
@@ -147,7 +153,7 @@ def error_from_response(
     }
     fields = field_errors(details)
     if fields:
-        message = message + "\n" + "\n".join(f"  - {line}" for line in fields)
+        common["field_errors"] = fields
 
     # A provider can refuse a job the moment it is submitted: the API answers
     # with the job already failed. That is a failed job (refunded), not a bad request.

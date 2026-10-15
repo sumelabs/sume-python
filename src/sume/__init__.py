@@ -26,7 +26,9 @@ from ._errors import (
     SumeError,
     WaitTimeoutError,
 )
-from ._types import Event, JobInfo, Model, Price, Status
+from ._files import FileInput
+from ._generated import ImageModelId, Inputs, ModelId, VideoModelId
+from ._types import Event, FieldError, JobInfo, JobState, Model, ModelKind, Price, Status
 from ._version import __version__
 from ._webhooks import verify_webhook
 
@@ -69,13 +71,20 @@ __all__ = [
     "AuthenticationError",
     "Client",
     "Event",
+    "FieldError",
     "File",
+    "FileInput",
+    "ImageModelId",
+    "Inputs",
     "InsufficientFundsError",
     "InvalidRequestError",
     "Job",
     "JobFailedError",
     "JobInfo",
+    "JobState",
     "Model",
+    "ModelId",
+    "ModelKind",
     "NotFoundError",
     "OverBudgetError",
     "Price",
@@ -83,6 +92,7 @@ __all__ = [
     "Result",
     "Status",
     "SumeError",
+    "VideoModelId",
     "WaitTimeoutError",
     "__version__",
     "cancel",

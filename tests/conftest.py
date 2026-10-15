@@ -71,6 +71,10 @@ class MockApi:
     artifacts: str = "image"
     """image, two-images, or video-with-poster."""
     fail_next: list[int] = field(default_factory=list)
+    slots_busy: int = 0
+    """How many submits to refuse with concurrency_limit_reached before accepting."""
+    reject_fields: bool = False
+    """Refuse submits with a field-level validation error."""
     """Status codes to answer the next API calls with, first in first out."""
     requests: list[httpx.Request] = field(default_factory=list)
     jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -171,6 +175,21 @@ class MockApi:
         return self.error(404, "not_found", f"No route {request.method} {path}.")
 
     def generate(self, request: httpx.Request, path: str, body: dict[str, Any]) -> httpx.Response:
+        if self.slots_busy > 0:
+            self.slots_busy -= 1
+            return self.error(429, "concurrency_limit_reached", "Too many jobs in flight.", retryable=True)
+        if self.reject_fields:
+            return self.error(
+                400,
+                "invalid_request",
+                "The request has invalid fields.",
+                details={
+                    "errors": [
+                        {"path": "duration", "message": "must be between 4 and 15"},
+                        {"path": "", "message": "bad"},
+                    ]
+                },
+            )
         model = next((m for m in MODELS if m["id"] == body.get("model")), None)
         if model is None:
             return self.error(404, "model_not_found", "No such model.")
@@ -197,6 +216,7 @@ class MockApi:
             "model": model["id"],
             "idempotency_key": key,
             "created_at": "2026-10-15T00:00:00.000Z",
+            "started_at": "2026-10-15T00:00:01.000Z",
             "completed_at": None,
             "input": {k: v for k, v in body.items() if k != "model"},
             "result": None,
@@ -220,6 +240,7 @@ class MockApi:
                 job["error"] = {"code": "provider_error", "message": "The provider timed out."}
             else:
                 job["status"] = "completed"
+                job["completed_at"] = "2026-10-15T00:00:16.500Z"
                 job["result"] = {"artifacts": self.make_artifacts(job_id)}
         state = job["status"]
         return self.ok(

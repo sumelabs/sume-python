@@ -6,8 +6,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
-JobState = str
-"""``queued``, ``processing``, ``completed``, ``failed`` or ``canceled``."""
+from typing_extensions import Literal
+
+JobState = Literal["queued", "processing", "completed", "failed", "canceled"]
+"""Where a job is: ``queued``, ``processing``, ``completed``, ``failed`` or ``canceled``."""
+
+ModelKind = Literal["image", "video", "lipsync", "captions"]
 
 TERMINAL_STATES = ("completed", "failed", "canceled")
 
@@ -30,7 +34,7 @@ class Model:
 
     id: str
     name: str
-    kind: str
+    kind: ModelKind
     """``image``, ``video``, ``lipsync`` or ``captions``."""
     company: str
     price_from: str
@@ -126,7 +130,7 @@ class Status:
             state = "queued" if state == "in_queue" else "processing"
         return cls(
             job_id=data.get("job_id") or (data.get("job") or {}).get("id", ""),
-            state=state,
+            state=state,  # type: ignore[arg-type]
             queue_position=data.get("queue_position"),
             next_poll_after_seconds=data.get("next_poll_after_seconds"),
             raw=data,
@@ -156,6 +160,11 @@ class Event:
     message: str | None
     created_at: str
     data: Mapping[str, Any] = field(repr=False, compare=False)
+
+    @property
+    def raw(self) -> Mapping[str, Any]:
+        """The API's JSON for the event, like every other type's ``raw``."""
+        return self.data
 
     @classmethod
     def from_api(cls, data: Mapping[str, Any]) -> Event:
@@ -207,12 +216,13 @@ def final_files(artifacts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any
 
 @dataclass(frozen=True)
 class JobInfo:
-    """A job as ``GET /v1/jobs/{id}`` describes it."""
+    """A job as ``GET /v1/jobs/{id}`` describes it: what it ran with, where it is, and how long it took."""
 
     id: str
     model: str | None
     state: JobState
     created_at: str
+    started_at: str | None
     completed_at: str | None
     error: Mapping[str, Any] | None
     input: Mapping[str, Any]
@@ -226,6 +236,7 @@ class JobInfo:
             model=data.get("model"),
             state=data.get("status", ""),
             created_at=data.get("created_at", ""),
+            started_at=data.get("started_at"),
             completed_at=data.get("completed_at"),
             error=data.get("error"),
             input=data.get("input") or {},
@@ -234,6 +245,33 @@ class JobInfo:
         )
 
     @property
+    def seconds(self) -> float | None:
+        """How long the job ran, from start (or creation) to completion, when it has completed."""
+        from datetime import datetime
+
+        def parse(value: str | None) -> datetime | None:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+            except ValueError:
+                return None
+
+        start = parse(self.started_at) or parse(self.created_at)
+        end = parse(self.completed_at)
+        return round((end - start).total_seconds(), 3) if start and end else None
+
+    @property
     def urls(self) -> list[str]:
         result = self.raw.get("result") or {}
         return [a["url"] for a in final_files(result.get("artifacts") or []) if a.get("url")]
+
+
+@dataclass(frozen=True)
+class FieldError:
+    """One field the API refused, like ``duration: must be between 4 and 15``."""
+
+    path: str
+    """The field, dotted for nested ones (``captions.style``); empty when the whole request is at fault."""
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.path}: {self.message}" if self.path else self.message

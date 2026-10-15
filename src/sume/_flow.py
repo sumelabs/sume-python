@@ -6,9 +6,9 @@ import difflib
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Sequence
 
-from ._errors import JobFailedError, NotFoundError, OverBudgetError, SumeError, WaitTimeoutError
-from ._inputs import describe, media_slots, with_media
-from ._types import Price, Status
+from ._errors import JobFailedError, NotFoundError, OverBudgetError, RateLimitError, SumeError, WaitTimeoutError
+from ._inputs import describe, upload_slots, with_uploads
+from ._types import FieldError, Price, Status
 
 DEFAULT_WAIT = 1800.0
 """How long ``run`` and ``wait`` wait by default: 30 minutes. Video can take 10 or more."""
@@ -51,13 +51,36 @@ def first_delay(submit: Mapping[str, Any]) -> float:
     return min(max(float(hint), 0.0), max_delay(0)) if isinstance(hint, (int, float)) else 0.0
 
 
-def timeout_error(job_id: str, timeout: float) -> WaitTimeoutError:
+def timeout_error(job_id: str, timeout: float, *, canceled: bool = False) -> WaitTimeoutError:
+    if canceled:
+        return WaitTimeoutError(
+            f"Stopped waiting after {round(timeout)} s, and canceled job {job_id} before it started. It is refunded.",
+            hint="Raise timeout=, or submit when the queue is shorter.",
+            code="wait_timeout",
+            job_id=job_id,
+        )
     return WaitTimeoutError(
         f"Stopped waiting after {round(timeout)} s; job {job_id} is still running.",
         hint=f'Pick it up later with sume.result("{job_id}"). Do not submit again: a second submit is a second charge.',
         code="wait_timeout",
         job_id=job_id,
     )
+
+
+SLOT_WAIT = 600.0
+"""How long ``submit`` waits for a free slot when the account has as many jobs running as it may."""
+
+
+def is_full(error: SumeError) -> bool:
+    """The account is at its limit of running jobs: wait for a slot, then submit again."""
+    return isinstance(error, RateLimitError)
+
+
+def slot_delay(error: SumeError, attempt: int) -> float:
+    """How long to wait before asking for a slot again: the API's word, else 2, 4, 8, … up to 15 s."""
+    if error.retry_after:
+        return min(float(error.retry_after), 30.0)
+    return min(2.0**attempt, 15.0)
 
 
 def failure(job_id: str, state: str, job: Mapping[str, Any] | None) -> JobFailedError:
@@ -105,6 +128,29 @@ def priced(get: Callable[[], Price]) -> Price:
         ) from None
 
 
+_LISTED = {
+    "aspect_ratio": "aspect_ratios",
+    "resolution": "resolutions",
+    "quality": "qualities",
+    "output_format": "output_formats",
+}
+
+
+def field_hint(model_id: str, capabilities: Any, fields: Sequence[FieldError]) -> str:
+    """What to do about refused fields: the values the catalog lists for them, then where to look."""
+    caps = capabilities if isinstance(capabilities, Mapping) else {}
+    parts: list[str] = []
+    for field in fields:
+        span = caps.get("duration_seconds")
+        values = caps.get(_LISTED.get(field.path, ""))
+        if field.path == "duration" and isinstance(span, Mapping) and "min" in span and "max" in span:
+            parts.append(f"duration {span['min']}–{span['max']} s")
+        elif isinstance(values, list) and values:
+            parts.append(f"{field.path} {', '.join(map(str, values))}")
+    takes = f"{model_id} takes {'; '.join(parts)}. " if parts else ""
+    return f'{takes}See all its fields with sume.model("{model_id}").'
+
+
 def model_not_found(model_id: str, known: Sequence[str]) -> NotFoundError:
     guess = difflib.get_close_matches(model_id, known, n=1, cutoff=0.6)
     return NotFoundError(
@@ -117,5 +163,6 @@ def model_not_found(model_id: str, known: Sequence[str]) -> NotFoundError:
 
 def estimate_input(body: Mapping[str, Any]) -> dict[str, Any]:
     """The body with placeholders for files not yet uploaded: the price does not depend on their URLs."""
-    slots = list(media_slots(body))
-    return with_media(body, [f"https://upload.invalid/{describe(value) or 'file'}" for _, _, value in slots])
+    return with_uploads(
+        body, [f"https://upload.invalid/{describe(value) or 'file'}" for _, value in upload_slots(body)]
+    )

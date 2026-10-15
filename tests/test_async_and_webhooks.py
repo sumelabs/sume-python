@@ -79,3 +79,12 @@ def test_verify_webhook_matches_the_sume_v1_vector() -> None:
     assert sume.verify_webhook(b"hello", rotating, "s3cret", now=1_700_000_000)
     assert sume.verify_webhook(b"hello", rotating, "new", now=1_700_000_000)
     assert not sume.verify_webhook(b"hello", {}, "s3cret")
+
+
+@pytest.mark.anyio
+async def test_async_field_errors_name_what_the_model_takes(async_client: sume.AsyncClient, api: MockApi) -> None:
+    api.reject_fields = True
+    with pytest.raises(sume.InvalidRequestError) as caught:
+        await async_client.run("seedance-2-mini", "a boat", duration=40)
+    assert [f.path for f in caught.value.field_errors] == ["duration", ""]
+    assert "Fix: seedance-2-mini takes duration 4–15 s." in str(caught.value)

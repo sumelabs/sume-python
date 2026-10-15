@@ -20,6 +20,10 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
+      - name: The types catch the mistakes in tests/typing_check.py
+        run: mypy --strict tests/typing_check.py
+      - name: The README's examples type-check
+        run: python scripts/check_readme.py
 
   test:
     strategy:

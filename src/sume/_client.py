@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Union
 from urllib.parse import quote
 
 import httpx
+from typing_extensions import Unpack
 
 from . import _flow
-from ._errors import APIConnectionError, APIError, NotFoundError, RateLimitError, SumeError
-from ._files import plan_paths, read_payload
+from ._errors import APIConnectionError, APIError, InvalidRequestError, NotFoundError, RateLimitError, SumeError
+from ._files import FileInput, plan_paths, read_payload
+from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import SyncTransport
-from ._inputs import build_body, media_slots, router_for, with_media
-from ._types import Event, FileInfo, JobInfo, Model, Price, Status, final_files
+from ._inputs import build_body, router_for, upload_slots, with_uploads
+from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, final_files
+
+logger = logging.getLogger("sume")
 
 StatusCallback = Callable[[Status], None]
+EventCallback = Callable[[Event], None]
+SubmitCallback = Callable[["Job"], None]
+Budget = Union[float, Decimal, str]
 
 
 class File(FileInfo):
@@ -44,7 +52,19 @@ class File(FileInfo):
         return target
 
     def read(self) -> bytes:
+        """The file's bytes, without saving it."""
         return self._transport.read(self.url)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "url": self.url,
+            "type": self.type,
+            "content_type": self.content_type,
+            "size_bytes": self.size_bytes,
+            "width": self.width,
+            "height": self.height,
+            "duration_ms": self.duration_ms,
+        }
 
     def __repr__(self) -> str:
         return f"File(url={self.url!r}, type={self.type!r}, content_type={self.content_type!r})"
@@ -59,6 +79,7 @@ class Result:
         usd: What it cost in US dollars, like ``"0.0077"``, when the price was known.
         files: The files you asked for (a video's poster frame is left out).
         all_files: Every file the job made, intermediate ones included.
+        job: The job as the API describes it: input, timing (``job.seconds``), and so on.
         raw: The API's ``result`` object.
     """
 
@@ -69,6 +90,7 @@ class Result:
         model: str | None,
         usd: str | None,
         result: Mapping[str, Any],
+        job: Mapping[str, Any] | None,
         transport: SyncTransport,
     ) -> None:
         artifacts = [a for a in (result.get("artifacts") or []) if isinstance(a, Mapping) and a.get("url")]
@@ -76,6 +98,7 @@ class Result:
         self.model = model
         self.usd = usd
         self.raw = result
+        self.job: JobInfo | None = JobInfo.from_api(job) if isinstance(job, Mapping) and job.get("id") else None
         self.all_files = [File(a, transport, model=model, job_id=job_id) for a in artifacts]
         finals = {id(a) for a in final_files(artifacts)}
         self.files = [f for f, a in zip(self.all_files, artifacts) if id(a) in finals]
@@ -99,6 +122,17 @@ class Result:
         for file, target in zip(self.files, targets):
             self._transport.download(file.url, target)
         return targets
+
+    def to_dict(self) -> Dict[str, Any]:
+        """A JSON-ready summary, for returning from a web handler."""
+        return {
+            "job_id": self.job_id,
+            "model": self.model,
+            "usd": self.usd,
+            "url": self.url,
+            "files": [f.to_dict() for f in self.files],
+            "seconds": self.job.seconds if self.job else None,
+        }
 
     def __repr__(self) -> str:
         usd = f", usd={self.usd!r}" if self.usd else ""
@@ -125,10 +159,12 @@ class Job:
         self.replayed = replayed
         """True when the idempotency key matched an earlier submit: this one paid nothing."""
         self.usd = usd
+        """The price in dollars, when it was known at submit."""
         self._client = client
         self._first_delay = first_delay
 
     def status(self) -> Status:
+        """Read the job's state once: ``queued``, ``processing``, ``completed``, ``failed`` or ``canceled``."""
         return self._client.status(self.id)
 
     def poll(self, *, timeout: float = _flow.DEFAULT_WAIT) -> Iterator[Status]:
@@ -163,32 +199,72 @@ class Job:
                 raise _flow.timeout_error(self.id, timeout)
             delay = _flow.next_delay(status, response.headers, time.monotonic() - started)
 
-    def wait(self, *, timeout: float = _flow.DEFAULT_WAIT, on_status: StatusCallback | None = None) -> Result:
-        """Wait for the job, then return its ``Result``. A failed or canceled job raises ``JobFailedError``."""
+    def wait(
+        self,
+        *,
+        timeout: float = _flow.DEFAULT_WAIT,
+        on_status: StatusCallback | None = None,
+        on_event: EventCallback | None = None,
+        cancel_on_timeout: bool = False,
+    ) -> Result:
+        """Wait for the job, then return its ``Result``. A failed or canceled job raises ``JobFailedError``.
+
+        Args:
+            timeout: Seconds to wait. Past it, ``WaitTimeoutError``; the job keeps running.
+            on_status: Called with each status read (``status.state``, ``status.queue_position``).
+            on_event: Called once with each new event in the job's life (``job.started``, …).
+            cancel_on_timeout: When the wait runs out, cancel the job if it has not started (it is refunded).
+        """
+        seen: set[str] = set()
         last: Status | None = None
-        for last in self.poll(timeout=timeout):
-            if on_status is not None:
-                on_status(last)
+        try:
+            for last in self.poll(timeout=timeout):
+                if on_status is not None:
+                    on_status(last)
+                if on_event is not None:
+                    self._emit_new_events(seen, on_event)
+        except SumeError as error:
+            if cancel_on_timeout and error.code == "wait_timeout":
+                try:
+                    canceled = self.cancel()
+                except SumeError:
+                    canceled = False
+                if canceled:
+                    raise _flow.timeout_error(self.id, timeout, canceled=True) from None
+            raise
         assert last is not None
+        transport = self._client._transport
         if not last.ok:
-            info = self._client._transport.request("GET", f"/v1/jobs/{quote(self.id)}").data.get("job")
+            info = transport.request("GET", f"/v1/jobs/{quote(self.id)}").data.get("job")
             raise _flow.failure(self.id, last.state, info)
-        data = self._client._transport.request("GET", f"/v1/jobs/{quote(self.id)}/result").data
+        data = transport.request("GET", f"/v1/jobs/{quote(self.id)}/result").data
         model = self.model or (data.get("job") or {}).get("model")
         return Result(
             job_id=self.id,
             model=model,
             usd=self.usd,
             result=data.get("result") or {},
-            transport=self._client._transport,
+            job=data.get("job"),
+            transport=transport,
         )
+
+    def _emit_new_events(self, seen: set[str], on_event: EventCallback) -> None:
+        try:
+            events = self.events()
+        except SumeError:
+            return
+        for event in events:
+            key = event.id or f"{event.type}@{event.created_at}"
+            if key not in seen:
+                seen.add(key)
+                on_event(event)
 
     def cancel(self) -> bool:
         """Cancel the job if generation has not started. Returns True when it was canceled (and refunded)."""
         return self._client.cancel(self.id)
 
     def events(self, *, limit: int | None = None) -> list[Event]:
-        """The job's lifecycle: ``job.created``, ``job.started``, ``job.completed`` or ``job.failed``."""
+        """The job's life so far: ``job.created``, ``job.started``, ``job.completed`` or ``job.failed``."""
         data = self._client._transport.request("GET", f"/v1/jobs/{quote(self.id)}/events", params={"limit": limit}).data
         return [Event.from_api(e) for e in data.get("events") or []]
 
@@ -209,6 +285,7 @@ class Client:
         timeout: Seconds per HTTP request (waiting for a job has its own ``timeout``).
         max_retries: Retries for requests that are safe to repeat: reads, and submits,
             which carry an idempotency key so a retry never pays twice.
+        headers: Extra headers for every API call (never sent to storage or media hosts).
         http_client: Your own ``httpx.Client``, for proxies or custom transports.
     """
 
@@ -219,10 +296,16 @@ class Client:
         base_url: str | None = None,
         timeout: float = 60.0,
         max_retries: int = 3,
+        headers: Mapping[str, str] | None = None,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._transport = SyncTransport(
-            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, http_client=http_client
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            http_client=http_client,
+            headers=headers,
         )
         self._models: dict[str, Model] = {}
 
@@ -241,31 +324,68 @@ class Client:
 
     # Models and prices: public, no key needed.
 
-    def models(self, kind: str | None = None) -> list[Model]:
-        """Every model in the open catalog, or only one ``kind``: ``image``, ``video``, ``lipsync``, ``captions``."""
+    def models(self, kind: ModelKind | None = None) -> list[Model]:
+        """Every model in the open catalog, or only one ``kind``: ``image``, ``video``, ``lipsync``, ``captions``.
+
+        Example:
+            >>> for m in sume.models("video"):
+            ...     print(m.id, m.price, m.seconds)
+            seedance-2-mini $0.0879–$0.1890/s (4, 15)
+        """
         data = self._transport.request("GET", "/v1/open/catalog", auth="optional").data
         models = [Model.from_api(m) for m in data.get("models") or []]
         for m in models:
             self._models[m.id] = m
         return [m for m in models if kind is None or m.kind == kind]
 
-    def model(self, model_id: str) -> Model:
+    def model(self, model_id: Union[ModelId, str]) -> Model:
         """One model: what it takes, its limits and its prices. Raises ``NotFoundError`` with a suggestion."""
         if model_id in self._models:
             return self._models[model_id]
         try:
             data = self._transport.request("GET", f"/v1/open/catalog/{quote(model_id)}", auth="optional").data
         except NotFoundError:
-            known = [m.id for m in self.models()]
-            raise _flow.model_not_found(model_id, known) from None
+            raise self._not_found(model_id) from None
         model = self._models[model_id] = Model.from_api(data)
         return model
 
-    def estimate(self, model: str, prompt: str | None = None, /, **inputs: Any) -> Price:
-        """What a request would cost, in dollars. Free, and needs no key. Files are not uploaded to price it."""
-        info = self.model(model)
-        body = build_body(info, inputs.pop("prompt", None) if prompt is None else prompt, inputs)
-        return self._estimate(info.id, _flow.estimate_input(body))
+    def _not_found(self, model_id: str) -> NotFoundError:
+        try:
+            known = [m.id for m in self.models()]
+        except SumeError:
+            known = list(MODEL_KINDS)
+        return _flow.model_not_found(model_id, known)
+
+    def _field_hint(self, model_id: str, error: InvalidRequestError) -> str:
+        try:
+            capabilities = self.model(model_id).raw.get("capabilities")
+        except SumeError:
+            capabilities = None
+        return _flow.field_hint(model_id, capabilities, error.field_errors)
+
+    def _kind(self, model_id: str) -> str:
+        """The model's kind, from the ids this version knows, else from the catalog."""
+        known = MODEL_KINDS.get(model_id)
+        return known if known is not None else self.model(model_id).kind
+
+    def estimate(
+        self,
+        model: Union[ModelId, str],
+        prompt: str | None = None,
+        /,
+        *,
+        input: Optional[Mapping[str, Any]] = None,
+        **inputs: Unpack[Inputs],
+    ) -> Price:
+        """What a request would cost, in dollars. Free, and needs no key. Files are not uploaded to price it.
+
+        Example:
+            >>> str(sume.estimate("seedance-2-mini", "a paper boat", duration=8, resolution="720p"))
+            '$1.5120'
+        """
+        fields: Dict[str, Any] = {**(input or {}), **inputs}
+        body = build_body(model, self._kind(model), fields.pop("prompt", None) if prompt is None else prompt, fields)
+        return self._estimate(model, _flow.estimate_input(body))
 
     def _estimate(self, model_id: str, body: Mapping[str, Any]) -> Price:
         data = self._transport.request(
@@ -275,7 +395,7 @@ class Client:
 
     # Files.
 
-    def upload(self, file: Any, *, content_type: str | None = None) -> str:
+    def upload(self, file: FileInput, *, content_type: str | None = None) -> str:
         """Put a file in Sume storage and return its URL, for any media input.
 
         ``file`` may be a path, bytes, an open binary file, or a PIL image.
@@ -305,85 +425,116 @@ class Client:
 
     def submit(
         self,
-        model: str,
+        model: Union[ModelId, str],
         prompt: str | None = None,
         /,
         *,
-        max_usd: float | Decimal | str | None = None,
+        max_usd: Budget | None = None,
         idempotency_key: str | None = None,
-        **inputs: Any,
+        input: Optional[Mapping[str, Any]] = None,
+        **inputs: Unpack[Inputs],
     ) -> Job:
         """Start a job and return at once. ``job.wait()`` gets its ``Result`` later.
 
-        Inputs use the API's field names (``quality="low"``, ``duration=4``,
-        ``aspect_ratio="16:9"``), plus ``image=``, ``video=``, ``audio=``,
-        ``end_image=``, ``reference_images=`` and ``mask=``. Media may be URLs
-        or local files; files are uploaded first.
+        Takes the same inputs as ``run``. When the account already has as many jobs
+        running as it may, ``submit`` waits for a free slot (up to 10 minutes) rather
+        than failing.
+
+        Example:
+            >>> job = sume.submit("kling-3", "a red kite over a beach", duration=5)
+            >>> video = job.wait()
         """
-        return self._submit(model, prompt, inputs, max_usd=max_usd, idempotency_key=idempotency_key, price_it=False)
+        fields: Dict[str, Any] = {**(input or {}), **inputs}
+        return self._submit(
+            model,
+            prompt,
+            fields,
+            max_usd=max_usd,
+            idempotency_key=idempotency_key,
+            price_it=False,
+            slot_wait=_flow.SLOT_WAIT,
+        )
 
     def run(
         self,
-        model: str,
+        model: Union[ModelId, str],
         prompt: str | None = None,
         /,
         *,
-        max_usd: float | Decimal | str | None = None,
+        max_usd: Budget | None = None,
         timeout: float = _flow.DEFAULT_WAIT,
         idempotency_key: str | None = None,
+        on_submit: SubmitCallback | None = None,
         on_status: StatusCallback | None = None,
-        **inputs: Any,
+        on_event: EventCallback | None = None,
+        cancel_on_timeout: bool = False,
+        input: Optional[Mapping[str, Any]] = None,
+        **inputs: Unpack[Inputs],
     ) -> Result:
         """Submit, wait, and return the ``Result``: the one call most code needs.
 
-        ``max_usd`` refuses to submit anything that costs more. ``timeout`` is how
-        long to wait (the job keeps running past it). ``on_status`` is called
-        with each status read.
+        Args:
+            model: A model id, like ``"gpt-image-2"`` or ``"seedance-2-mini"``. ``sume.models()`` lists them.
+            prompt: What to make.
+            max_usd: Refuse to submit anything that costs more, before uploading or charging.
+            timeout: Seconds to wait in all (for a free slot and for the job). The job keeps running past it.
+            idempotency_key: Reuse an earlier submit's key to get that job instead of paying again.
+            on_submit: Called with the ``Job`` once it exists, so you can keep its id.
+            on_status: Called with each status read.
+            on_event: Called with each new event in the job's life.
+            cancel_on_timeout: Cancel the job (and get refunded) if the wait runs out before it starts.
+            input: Request fields as a dict, for any field the keyword arguments do not list.
+            **inputs: Request fields by the API's names (``quality``, ``duration``, ``resolution``, …) and
+                media by short name (``image``, ``video``, ``audio``, …). Files are uploaded first.
+
+        Example:
+            >>> image = sume.run("gpt-image-2", "a red kite over a beach", quality="low")
+            >>> image.save("kite.png")
+            [PosixPath('/home/you/kite.png')]
         """
-        job = self._submit(model, prompt, inputs, max_usd=max_usd, idempotency_key=idempotency_key, price_it=True)
-        return job.wait(timeout=timeout, on_status=on_status)
+        started = time.monotonic()
+        fields: Dict[str, Any] = {**(input or {}), **inputs}
+        job = self._submit(
+            model,
+            prompt,
+            fields,
+            max_usd=max_usd,
+            idempotency_key=idempotency_key,
+            price_it=True,
+            slot_wait=timeout,
+        )
+        if on_submit is not None:
+            on_submit(job)
+        remaining = max(timeout - (time.monotonic() - started), 0.001)
+        return job.wait(timeout=remaining, on_status=on_status, on_event=on_event, cancel_on_timeout=cancel_on_timeout)
 
     def _submit(
         self,
         model: str,
         prompt: str | None,
-        inputs: dict[str, Any],
+        fields: Dict[str, Any],
         *,
-        max_usd: float | Decimal | str | None,
+        max_usd: Budget | None,
         idempotency_key: str | None,
         price_it: bool,
+        slot_wait: float,
     ) -> Job:
-        info = self.model(model)
-        body = build_body(info, inputs.pop("prompt", None) if prompt is None else prompt, inputs)
+        kind = self._kind(model)
+        body = build_body(model, kind, fields.pop("prompt", None) if prompt is None else prompt, fields)
         pricing: Future[Price] | None = None
         pool: ThreadPoolExecutor | None = None
         if price_it or max_usd is not None:
             # Priced beside the uploads and the submit, so knowing the cost adds no wait.
             pool = ThreadPoolExecutor(max_workers=1)
-            pricing = pool.submit(self._estimate, info.id, _flow.estimate_input(body))
+            pricing = pool.submit(self._estimate, model, _flow.estimate_input(body))
         try:
             if max_usd is not None:
                 assert pricing is not None
                 _flow.check_budget(_flow.priced(pricing.result), max_usd)
-            urls = [self.upload(value) for _, _, value in media_slots(body)]
-            body = with_media(body, urls)
+            urls = [self.upload(value) for _, value in upload_slots(body)]
+            body = with_uploads(body, urls)
             key = idempotency_key or str(uuid.uuid4())
-            try:
-                data = self._transport.request(
-                    "POST",
-                    f"/v1/{router_for(info)}-router/generate",
-                    json={**body, "model": info.id},
-                    idempotency_key=key,
-                ).data
-            except SumeError as error:
-                # A network or server error leaves the outcome open: name the key, so a
-                # retry with it adopts the job instead of paying for a second one.
-                if error.status is None or error.status >= 500:
-                    error.idempotency_key = key
-                    error.hint = (error.hint + " " if error.hint else "") + (
-                        f"If the submit went through, pass idempotency_key={key!r} to get that job back."
-                    )
-                raise
+            data = self._generate(model, kind, body, key, slot_wait)
             usd: str | None = None
             if pricing is not None:
                 try:
@@ -397,12 +548,49 @@ class Client:
         return Job(
             self,
             job["id"],
-            model=job.get("model") or info.id,
+            model=job.get("model") or model,
             idempotency_key=key,
             replayed=bool(data.get("idempotency_hit")),
             usd=usd,
             first_delay=_flow.first_delay(data),
         )
+
+    def _generate(self, model: str, kind: str, body: Mapping[str, Any], key: str, slot_wait: float) -> Any:
+        deadline = time.monotonic() + slot_wait
+        attempt = 0
+        while True:
+            try:
+                return self._transport.request(
+                    "POST",
+                    f"/v1/{router_for(kind)}-router/generate",
+                    json={**body, "model": model},
+                    idempotency_key=key,
+                ).data
+            except NotFoundError as error:
+                if error.code == "model_not_found":
+                    raise self._not_found(model) from None
+                raise
+            except InvalidRequestError as error:
+                if error.field_errors:
+                    error.hint = self._field_hint(model, error)
+                raise
+            except SumeError as error:
+                if _flow.is_full(error):
+                    # The account has as many jobs running as it may: wait for a slot, then ask again.
+                    attempt += 1
+                    delay = _flow.slot_delay(error, attempt)
+                    if time.monotonic() + delay < deadline:
+                        logger.info("All job slots are busy; asking again in %.0f s", delay)
+                        self._transport.sleep(delay)
+                        continue
+                # A network or server error leaves the outcome open: name the key, so a
+                # retry with it adopts the job instead of paying for a second one.
+                if error.status is None or error.status >= 500:
+                    error.idempotency_key = key
+                    error.hint = (error.hint + " " if error.hint else "") + (
+                        f"If the submit went through, pass idempotency_key={key!r} to get that job back."
+                    )
+                raise
 
     # Jobs.
 
@@ -415,10 +603,15 @@ class Client:
         return Status.from_api(self._transport.request("GET", f"/v1/jobs/{quote(job_id)}/status", timeout=20.0).data)
 
     def result(
-        self, job_id: str, *, timeout: float = _flow.DEFAULT_WAIT, on_status: StatusCallback | None = None
+        self,
+        job_id: str,
+        *,
+        timeout: float = _flow.DEFAULT_WAIT,
+        on_status: StatusCallback | None = None,
+        on_event: EventCallback | None = None,
     ) -> Result:
         """Wait for a job (if it is still running) and return its ``Result``."""
-        return Job(self, job_id).wait(timeout=timeout, on_status=on_status)
+        return Job(self, job_id).wait(timeout=timeout, on_status=on_status, on_event=on_event)
 
     def cancel(self, job_id: str) -> bool:
         """Cancel a job that has not started generating. Returns True when it was canceled; it is refunded."""

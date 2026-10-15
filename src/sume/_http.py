@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import platform
 import random
@@ -19,6 +20,9 @@ from ._config import resolve_api_key, resolve_base_url
 from ._constants import KEYS_URL
 from ._errors import APIConnectionError, APIError, AuthenticationError, SumeError, error_from_response
 from ._version import __version__
+
+logger = logging.getLogger("sume")
+"""Debug lines for each API call: method, path, status, request id, time. Never the key or an upload URL."""
 
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_RETRY_DELAY = 30.0
@@ -58,11 +62,20 @@ def retry_delay(headers: Mapping[str, str], error: SumeError, attempt: int) -> f
 
 
 class _Base:
-    def __init__(self, *, api_key: str | None, base_url: str | None, timeout: float, max_retries: int) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        base_url: str | None,
+        timeout: float,
+        max_retries: int,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         if base_url is not None:
             resolve_base_url(base_url)  # refuse a bad URL at construction, not at the first call
         self._explicit_base = base_url
         self._explicit_key = api_key
+        self._extra_headers = {k.lower(): v for k, v in (headers or {}).items()}
         self.timeout = timeout
         self.max_retries = max_retries
 
@@ -83,7 +96,7 @@ class _Base:
         return key
 
     def _headers(self, key: str | None, idempotency_key: str | None, has_body: bool) -> dict[str, str]:
-        headers = {"accept": "application/json", "user-agent": USER_AGENT}
+        headers = {"accept": "application/json", "user-agent": USER_AGENT, **self._extra_headers}
         if key:
             headers["authorization"] = f"Bearer {key}"
         if idempotency_key:
@@ -129,6 +142,19 @@ class _Base:
         )
 
 
+def _log(method: str, path: str, response: httpx.Response, attempt: int, started: float) -> None:
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "%s %s -> %s (request %s, attempt %d, %d ms)",
+            method,
+            path,
+            response.status_code,
+            response.headers.get("x-sume-request-id", "-"),
+            attempt,
+            round((time.monotonic() - started) * 1000),
+        )
+
+
 def _retryable(error: SumeError) -> bool:
     return error.status in RETRY_STATUSES and error.code not in ("concurrency_limit_reached", "queue_full")
 
@@ -143,8 +169,9 @@ class SyncTransport(_Base):
         max_retries: int,
         http_client: httpx.Client | None,
         sleep: Callable[[float], None] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
-        super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
+        super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
         self.http = http_client or httpx.Client(follow_redirects=True)
         self._owns_http = http_client is None
         # Looked up at call time, so tests can stand in for the clock.
@@ -172,6 +199,7 @@ class SyncTransport(_Base):
         query = {k: v for k, v in (params or {}).items() if v is not None}
         attempts = 1 + (self.max_retries if (retry if retry is not None else method == "GET" or idempotency_key) else 0)
         for attempt in range(1, attempts + 1):
+            started = time.monotonic()
             try:
                 response = self.http.request(
                     method, url, json=json, params=query, headers=headers, timeout=timeout or self.timeout
@@ -182,6 +210,7 @@ class SyncTransport(_Base):
                     continue
                 raise self._connection_error(url, error) from None
             result, failure = self._parse(method, path, response)
+            _log(method, path, response, attempt, started)
             if result is not None:
                 return result
             assert failure is not None
@@ -250,8 +279,9 @@ class AsyncTransport(_Base):
         max_retries: int,
         http_client: httpx.AsyncClient | None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
-        super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
+        super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
         self._given_http = http_client
         # One connection pool per event loop: a pool made under one asyncio.run()
         # cannot be used under the next, and module-level helpers outlive loops.
@@ -298,6 +328,7 @@ class AsyncTransport(_Base):
         query = {k: v for k, v in (params or {}).items() if v is not None}
         attempts = 1 + (self.max_retries if (retry if retry is not None else method == "GET" or idempotency_key) else 0)
         for attempt in range(1, attempts + 1):
+            started = time.monotonic()
             try:
                 response = await self.http.request(
                     method, url, json=json, params=query, headers=headers, timeout=timeout or self.timeout
@@ -308,6 +339,7 @@ class AsyncTransport(_Base):
                     continue
                 raise self._connection_error(url, error) from None
             result, failure = self._parse(method, path, response)
+            _log(method, path, response, attempt, started)
             if result is not None:
                 return result
             assert failure is not None

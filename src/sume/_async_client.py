@@ -3,24 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Mapping, Optional, Union
 from urllib.parse import quote
 
 import httpx
+from typing_extensions import Unpack
 
 from . import _flow
-from ._errors import APIConnectionError, APIError, NotFoundError, RateLimitError, SumeError
-from ._files import plan_paths, read_payload
+from ._errors import APIConnectionError, APIError, InvalidRequestError, NotFoundError, RateLimitError, SumeError
+from ._files import FileInput, plan_paths, read_payload
+from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import AsyncTransport
-from ._inputs import build_body, media_slots, router_for, with_media
-from ._types import Event, FileInfo, JobInfo, Model, Price, Status, final_files
+from ._inputs import build_body, router_for, upload_slots, with_uploads
+from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, final_files
+
+logger = logging.getLogger("sume")
 
 AsyncStatusCallback = Callable[[Status], Union[Awaitable[None], None]]
+AsyncEventCallback = Callable[[Event], Union[Awaitable[None], None]]
+AsyncSubmitCallback = Callable[["AsyncJob"], Union[Awaitable[None], None]]
+Budget = Union[float, Decimal, str]
+
+
+async def _call(callback: Callable[[Any], Union[Awaitable[None], None]], value: Any) -> None:
+    outcome = callback(value)
+    if asyncio.iscoroutine(outcome):
+        await outcome
 
 
 class AsyncFile(FileInfo):
@@ -45,6 +59,17 @@ class AsyncFile(FileInfo):
     async def read(self) -> bytes:
         return await self._transport.read(self.url)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "url": self.url,
+            "type": self.type,
+            "content_type": self.content_type,
+            "size_bytes": self.size_bytes,
+            "width": self.width,
+            "height": self.height,
+            "duration_ms": self.duration_ms,
+        }
+
     def __repr__(self) -> str:
         return f"AsyncFile(url={self.url!r}, type={self.type!r}, content_type={self.content_type!r})"
 
@@ -59,6 +84,7 @@ class AsyncResult:
         model: str | None,
         usd: str | None,
         result: Mapping[str, Any],
+        job: Mapping[str, Any] | None,
         transport: AsyncTransport,
     ) -> None:
         artifacts = [a for a in (result.get("artifacts") or []) if isinstance(a, Mapping) and a.get("url")]
@@ -66,6 +92,7 @@ class AsyncResult:
         self.model = model
         self.usd = usd
         self.raw = result
+        self.job: JobInfo | None = JobInfo.from_api(job) if isinstance(job, Mapping) and job.get("id") else None
         self.all_files = [AsyncFile(a, transport, model=model, job_id=job_id) for a in artifacts]
         finals = {id(a) for a in final_files(artifacts)}
         self.files = [f for f, a in zip(self.all_files, artifacts) if id(a) in finals]
@@ -84,6 +111,16 @@ class AsyncResult:
         for file, target in zip(self.files, targets):
             await self._transport.download(file.url, target)
         return targets
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "model": self.model,
+            "usd": self.usd,
+            "url": self.url,
+            "files": [f.to_dict() for f in self.files],
+            "seconds": self.job.seconds if self.job else None,
+        }
 
     def __repr__(self) -> str:
         usd = f", usd={self.usd!r}" if self.usd else ""
@@ -144,14 +181,30 @@ class AsyncJob:
             delay = _flow.next_delay(status, response.headers, time.monotonic() - started)
 
     async def wait(
-        self, *, timeout: float = _flow.DEFAULT_WAIT, on_status: AsyncStatusCallback | None = None
+        self,
+        *,
+        timeout: float = _flow.DEFAULT_WAIT,
+        on_status: AsyncStatusCallback | None = None,
+        on_event: AsyncEventCallback | None = None,
+        cancel_on_timeout: bool = False,
     ) -> AsyncResult:
+        seen: set[str] = set()
         last: Status | None = None
-        async for last in self.poll(timeout=timeout):
-            if on_status is not None:
-                outcome = on_status(last)
-                if asyncio.iscoroutine(outcome):
-                    await outcome
+        try:
+            async for last in self.poll(timeout=timeout):
+                if on_status is not None:
+                    await _call(on_status, last)
+                if on_event is not None:
+                    await self._emit_new_events(seen, on_event)
+        except SumeError as error:
+            if cancel_on_timeout and error.code == "wait_timeout":
+                try:
+                    canceled = await self.cancel()
+                except SumeError:
+                    canceled = False
+                if canceled:
+                    raise _flow.timeout_error(self.id, timeout, canceled=True) from None
+            raise
         assert last is not None
         transport = self._client._transport
         if not last.ok:
@@ -160,8 +213,24 @@ class AsyncJob:
         data = (await transport.request("GET", f"/v1/jobs/{quote(self.id)}/result")).data
         model = self.model or (data.get("job") or {}).get("model")
         return AsyncResult(
-            job_id=self.id, model=model, usd=self.usd, result=data.get("result") or {}, transport=transport
+            job_id=self.id,
+            model=model,
+            usd=self.usd,
+            result=data.get("result") or {},
+            job=data.get("job"),
+            transport=transport,
         )
+
+    async def _emit_new_events(self, seen: set[str], on_event: AsyncEventCallback) -> None:
+        try:
+            events = await self.events()
+        except SumeError:
+            return
+        for event in events:
+            key = event.id or f"{event.type}@{event.created_at}"
+            if key not in seen:
+                seen.add(key)
+                await _call(on_event, event)
 
     async def cancel(self) -> bool:
         return await self._client.cancel(self.id)
@@ -191,10 +260,16 @@ class AsyncClient:
         base_url: str | None = None,
         timeout: float = 60.0,
         max_retries: int = 3,
+        headers: Mapping[str, str] | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._transport = AsyncTransport(
-            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, http_client=http_client
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            http_client=http_client,
+            headers=headers,
         )
         self._models: dict[str, Model] = {}
 
@@ -211,28 +286,55 @@ class AsyncClient:
     async def __aexit__(self, *exc: object) -> None:
         await self.close()
 
-    async def models(self, kind: str | None = None) -> list[Model]:
+    async def models(self, kind: ModelKind | None = None) -> list[Model]:
         data = (await self._transport.request("GET", "/v1/open/catalog", auth="optional")).data
         models = [Model.from_api(m) for m in data.get("models") or []]
         for m in models:
             self._models[m.id] = m
         return [m for m in models if kind is None or m.kind == kind]
 
-    async def model(self, model_id: str) -> Model:
+    async def model(self, model_id: Union[ModelId, str]) -> Model:
         if model_id in self._models:
             return self._models[model_id]
         try:
             data = (await self._transport.request("GET", f"/v1/open/catalog/{quote(model_id)}", auth="optional")).data
         except NotFoundError:
-            known = [m.id for m in await self.models()]
-            raise _flow.model_not_found(model_id, known) from None
+            raise await self._not_found(model_id) from None
         model = self._models[model_id] = Model.from_api(data)
         return model
 
-    async def estimate(self, model: str, prompt: str | None = None, /, **inputs: Any) -> Price:
-        info = await self.model(model)
-        body = build_body(info, inputs.pop("prompt", None) if prompt is None else prompt, inputs)
-        return await self._estimate(info.id, _flow.estimate_input(body))
+    async def _not_found(self, model_id: str) -> NotFoundError:
+        try:
+            known = [m.id for m in await self.models()]
+        except SumeError:
+            known = list(MODEL_KINDS)
+        return _flow.model_not_found(model_id, known)
+
+    async def _field_hint(self, model_id: str, error: InvalidRequestError) -> str:
+        try:
+            capabilities = (await self.model(model_id)).raw.get("capabilities")
+        except SumeError:
+            capabilities = None
+        return _flow.field_hint(model_id, capabilities, error.field_errors)
+
+    async def _kind(self, model_id: str) -> str:
+        known = MODEL_KINDS.get(model_id)
+        return known if known is not None else (await self.model(model_id)).kind
+
+    async def estimate(
+        self,
+        model: Union[ModelId, str],
+        prompt: str | None = None,
+        /,
+        *,
+        input: Optional[Mapping[str, Any]] = None,
+        **inputs: Unpack[Inputs],
+    ) -> Price:
+        fields: Dict[str, Any] = {**(input or {}), **inputs}
+        body = build_body(
+            model, await self._kind(model), fields.pop("prompt", None) if prompt is None else prompt, fields
+        )
+        return await self._estimate(model, _flow.estimate_input(body))
 
     async def _estimate(self, model_id: str, body: Mapping[str, Any]) -> Price:
         data = (
@@ -242,7 +344,7 @@ class AsyncClient:
         ).data
         return Price.from_api(data)
 
-    async def upload(self, file: Any, *, content_type: str | None = None) -> str:
+    async def upload(self, file: FileInput, *, content_type: str | None = None) -> str:
         payload = read_payload(file, content_type)
         target = (
             await self._transport.request(
@@ -273,48 +375,76 @@ class AsyncClient:
 
     async def submit(
         self,
-        model: str,
+        model: Union[ModelId, str],
         prompt: str | None = None,
         /,
         *,
-        max_usd: float | Decimal | str | None = None,
+        max_usd: Budget | None = None,
         idempotency_key: str | None = None,
-        **inputs: Any,
+        input: Optional[Mapping[str, Any]] = None,
+        **inputs: Unpack[Inputs],
     ) -> AsyncJob:
+        fields: Dict[str, Any] = {**(input or {}), **inputs}
         return await self._submit(
-            model, prompt, inputs, max_usd=max_usd, idempotency_key=idempotency_key, price_it=False
+            model,
+            prompt,
+            fields,
+            max_usd=max_usd,
+            idempotency_key=idempotency_key,
+            price_it=False,
+            slot_wait=_flow.SLOT_WAIT,
         )
 
     async def run(
         self,
-        model: str,
+        model: Union[ModelId, str],
         prompt: str | None = None,
         /,
         *,
-        max_usd: float | Decimal | str | None = None,
+        max_usd: Budget | None = None,
         timeout: float = _flow.DEFAULT_WAIT,
         idempotency_key: str | None = None,
+        on_submit: AsyncSubmitCallback | None = None,
         on_status: AsyncStatusCallback | None = None,
-        **inputs: Any,
+        on_event: AsyncEventCallback | None = None,
+        cancel_on_timeout: bool = False,
+        input: Optional[Mapping[str, Any]] = None,
+        **inputs: Unpack[Inputs],
     ) -> AsyncResult:
-        job = await self._submit(model, prompt, inputs, max_usd=max_usd, idempotency_key=idempotency_key, price_it=True)
-        return await job.wait(timeout=timeout, on_status=on_status)
+        started = time.monotonic()
+        fields: Dict[str, Any] = {**(input or {}), **inputs}
+        job = await self._submit(
+            model,
+            prompt,
+            fields,
+            max_usd=max_usd,
+            idempotency_key=idempotency_key,
+            price_it=True,
+            slot_wait=timeout,
+        )
+        if on_submit is not None:
+            await _call(on_submit, job)
+        remaining = max(timeout - (time.monotonic() - started), 0.001)
+        return await job.wait(
+            timeout=remaining, on_status=on_status, on_event=on_event, cancel_on_timeout=cancel_on_timeout
+        )
 
     async def _submit(
         self,
         model: str,
         prompt: str | None,
-        inputs: dict[str, Any],
+        fields: Dict[str, Any],
         *,
-        max_usd: float | Decimal | str | None,
+        max_usd: Budget | None,
         idempotency_key: str | None,
         price_it: bool,
+        slot_wait: float,
     ) -> AsyncJob:
-        info = await self.model(model)
-        body = build_body(info, inputs.pop("prompt", None) if prompt is None else prompt, inputs)
+        kind = await self._kind(model)
+        body = build_body(model, kind, fields.pop("prompt", None) if prompt is None else prompt, fields)
         pricing: asyncio.Task[Price] | None = None
         if price_it or max_usd is not None:
-            pricing = asyncio.ensure_future(self._estimate(info.id, _flow.estimate_input(body)))
+            pricing = asyncio.ensure_future(self._estimate(model, _flow.estimate_input(body)))
         try:
             if max_usd is not None:
                 assert pricing is not None
@@ -323,25 +453,10 @@ class AsyncClient:
                 except SumeError:
                     price = _flow.priced(pricing.result)
                 _flow.check_budget(price, max_usd)
-            urls = [await self.upload(value) for _, _, value in media_slots(body)]
-            body = with_media(body, urls)
+            urls = [await self.upload(value) for _, value in upload_slots(body)]
+            body = with_uploads(body, urls)
             key = idempotency_key or str(uuid.uuid4())
-            try:
-                data = (
-                    await self._transport.request(
-                        "POST",
-                        f"/v1/{router_for(info)}-router/generate",
-                        json={**body, "model": info.id},
-                        idempotency_key=key,
-                    )
-                ).data
-            except SumeError as error:
-                if error.status is None or error.status >= 500:
-                    error.idempotency_key = key
-                    error.hint = (error.hint + " " if error.hint else "") + (
-                        f"If the submit went through, pass idempotency_key={key!r} to get that job back."
-                    )
-                raise
+            data = await self._generate(model, kind, body, key, slot_wait)
             usd: str | None = None
             if pricing is not None:
                 try:
@@ -355,12 +470,47 @@ class AsyncClient:
         return AsyncJob(
             self,
             job["id"],
-            model=job.get("model") or info.id,
+            model=job.get("model") or model,
             idempotency_key=key,
             replayed=bool(data.get("idempotency_hit")),
             usd=usd,
             first_delay=_flow.first_delay(data),
         )
+
+    async def _generate(self, model: str, kind: str, body: Mapping[str, Any], key: str, slot_wait: float) -> Any:
+        deadline = time.monotonic() + slot_wait
+        attempt = 0
+        while True:
+            try:
+                response = await self._transport.request(
+                    "POST",
+                    f"/v1/{router_for(kind)}-router/generate",
+                    json={**body, "model": model},
+                    idempotency_key=key,
+                )
+                return response.data
+            except NotFoundError as error:
+                if error.code == "model_not_found":
+                    raise await self._not_found(model) from None
+                raise
+            except InvalidRequestError as error:
+                if error.field_errors:
+                    error.hint = await self._field_hint(model, error)
+                raise
+            except SumeError as error:
+                if _flow.is_full(error):
+                    attempt += 1
+                    delay = _flow.slot_delay(error, attempt)
+                    if time.monotonic() + delay < deadline:
+                        logger.info("All job slots are busy; asking again in %.0f s", delay)
+                        await self._transport.sleep(delay)
+                        continue
+                if error.status is None or error.status >= 500:
+                    error.idempotency_key = key
+                    error.hint = (error.hint + " " if error.hint else "") + (
+                        f"If the submit went through, pass idempotency_key={key!r} to get that job back."
+                    )
+                raise
 
     def job(self, job_id: str) -> AsyncJob:
         return AsyncJob(self, job_id)
@@ -371,9 +521,14 @@ class AsyncClient:
         )
 
     async def result(
-        self, job_id: str, *, timeout: float = _flow.DEFAULT_WAIT, on_status: AsyncStatusCallback | None = None
+        self,
+        job_id: str,
+        *,
+        timeout: float = _flow.DEFAULT_WAIT,
+        on_status: AsyncStatusCallback | None = None,
+        on_event: AsyncEventCallback | None = None,
     ) -> AsyncResult:
-        return await AsyncJob(self, job_id).wait(timeout=timeout, on_status=on_status)
+        return await AsyncJob(self, job_id).wait(timeout=timeout, on_status=on_status, on_event=on_event)
 
     async def cancel(self, job_id: str) -> bool:
         data = (await self._transport.request("POST", f"/v1/jobs/{quote(job_id)}/cancel", retry=True)).data

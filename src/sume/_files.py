@@ -7,10 +7,22 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import IO, Any, Sequence, Union
+
+from typing_extensions import Protocol
 
 from ._errors import InvalidRequestError
 from ._media import EXTENSIONS_LIST, content_type_for_name, extension_for, sniff_content_type
+
+
+class SupportsImageSave(Protocol):
+    """A PIL image, or anything else with PIL's ``save(fp, format=...)``."""
+
+    def save(self, fp: Any, format: Any = ..., **params: Any) -> None: ...
+
+
+FileInput = Union[str, "os.PathLike[str]", bytes, bytearray, memoryview, IO[bytes], SupportsImageSave]
+"""Anything the client can upload: a URL (sent as is), a file path, bytes, an open binary file, or a PIL image."""
 
 
 @dataclass(frozen=True)
