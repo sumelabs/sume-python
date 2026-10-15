@@ -52,6 +52,12 @@ def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
+def take_prompt(prompt: str | None, fields: dict[str, Any]) -> str | None:
+    """The prompt passed by position, else ``prompt=``. ``fields`` loses its ``prompt`` either way."""
+    named = fields.pop("prompt", None)
+    return prompt if prompt is not None else named
+
+
 def build_body(model_id: str, kind: str, prompt: str | None, inputs: Mapping[str, Any]) -> dict[str, Any]:
     """The router request body, without ``model``. ``None`` values are left out."""
     router = router_for(kind)

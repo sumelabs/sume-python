@@ -38,7 +38,7 @@ class Model:
     """``image``, ``video``, ``lipsync`` or ``captions``."""
     company: str
     price_from: str
-    """Dollars per ``per`` for the cheapest option, like ``"0.0077"``."""
+    """Dollars per ``per`` for the cheapest option, like ``"0.0060"``."""
     price_to: str | None
     """Dollars per ``per`` for the dearest option, when it differs."""
     per: str
@@ -81,7 +81,7 @@ class Model:
 
     @property
     def price(self) -> str:
-        """``$0.0077/image`` or ``$0.0879–$0.1890/s``."""
+        """``$0.0060/image`` or ``$0.02936–$0.06352/s``."""
         unit = _UNITS.get(self.per, f"/{self.per}")
         return f"${self.price_from}{f'–${self.price_to}' if self.price_to else ''}{unit}"
 
@@ -95,7 +95,7 @@ class Price:
 
     model: str
     usd: str
-    """Dollars, as the API writes them: ``"0.0077"``."""
+    """Dollars, as the API writes them: ``"0.0060"``."""
     usd_micros: int
     raw: Mapping[str, Any] = field(repr=False, compare=False)
 

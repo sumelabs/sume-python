@@ -128,3 +128,10 @@ def test_the_generated_types_cover_the_catalog() -> None:
     assert ids == set(MODEL_KINDS)
     assert set(get_args(sume.ImageModelId)) | set(get_args(sume.VideoModelId)) == ids
     assert {"prompt", "image", "duration", "captions", "quality"} <= set(sume.Inputs.__annotations__)
+
+
+def test_the_prompt_by_position_wins_over_prompt_by_name(client: sume.Client, api: MockApi) -> None:
+    client.run("gpt-image-2", "by position", prompt="by name")
+    client.run("gpt-image-2", prompt="only by name")
+    bodies = [json.loads(r.content) for r in api.calls("POST", "/v1/image-router/generate")]
+    assert [b["prompt"] for b in bodies] == ["by position", "only by name"]

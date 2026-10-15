@@ -20,7 +20,7 @@ from ._errors import APIConnectionError, APIError, InvalidRequestError, NotFound
 from ._files import FileInput, plan_paths, read_payload
 from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import AsyncTransport
-from ._inputs import build_body, router_for, upload_slots, with_uploads
+from ._inputs import build_body, router_for, take_prompt, upload_slots, with_uploads
 from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, final_files
 
 logger = logging.getLogger("sume")
@@ -331,9 +331,7 @@ class AsyncClient:
         **inputs: Unpack[Inputs],
     ) -> Price:
         fields: Dict[str, Any] = {**(input or {}), **inputs}
-        body = build_body(
-            model, await self._kind(model), fields.pop("prompt", None) if prompt is None else prompt, fields
-        )
+        body = build_body(model, await self._kind(model), take_prompt(prompt, fields), fields)
         return await self._estimate(model, _flow.estimate_input(body))
 
     async def _estimate(self, model_id: str, body: Mapping[str, Any]) -> Price:
@@ -441,7 +439,7 @@ class AsyncClient:
         slot_wait: float,
     ) -> AsyncJob:
         kind = await self._kind(model)
-        body = build_body(model, kind, fields.pop("prompt", None) if prompt is None else prompt, fields)
+        body = build_body(model, kind, take_prompt(prompt, fields), fields)
         pricing: asyncio.Task[Price] | None = None
         if price_it or max_usd is not None:
             pricing = asyncio.ensure_future(self._estimate(model, _flow.estimate_input(body)))

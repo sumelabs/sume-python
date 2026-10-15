@@ -20,7 +20,7 @@ from ._errors import APIConnectionError, APIError, InvalidRequestError, NotFound
 from ._files import FileInput, plan_paths, read_payload
 from ._generated import MODEL_KINDS, Inputs, ModelId
 from ._http import SyncTransport
-from ._inputs import build_body, router_for, upload_slots, with_uploads
+from ._inputs import build_body, router_for, take_prompt, upload_slots, with_uploads
 from ._types import Event, FileInfo, JobInfo, Model, ModelKind, Price, Status, final_files
 
 logger = logging.getLogger("sume")
@@ -76,7 +76,7 @@ class Result:
     Attributes:
         job_id: The job's id.
         model: The model that ran.
-        usd: What it cost in US dollars, like ``"0.0077"``, when the price was known.
+        usd: What it cost in US dollars, like ``"0.0060"``, when the price was known.
         files: The files you asked for (a video's poster frame is left out).
         all_files: Every file the job made, intermediate ones included.
         job: The job as the API describes it: input, timing (``job.seconds``), and so on.
@@ -330,7 +330,7 @@ class Client:
         Example:
             >>> for m in sume.models("video"):
             ...     print(m.id, m.price, m.seconds)
-            seedance-2-mini $0.0879–$0.1890/s (4, 15)
+            seedance-2-mini $0.02936–$0.06352/s (4, 15)
         """
         data = self._transport.request("GET", "/v1/open/catalog", auth="optional").data
         models = [Model.from_api(m) for m in data.get("models") or []]
@@ -381,10 +381,10 @@ class Client:
 
         Example:
             >>> str(sume.estimate("seedance-2-mini", "a paper boat", duration=8, resolution="720p"))
-            '$1.5120'
+            '$0.5082'
         """
         fields: Dict[str, Any] = {**(input or {}), **inputs}
-        body = build_body(model, self._kind(model), fields.pop("prompt", None) if prompt is None else prompt, fields)
+        body = build_body(model, self._kind(model), take_prompt(prompt, fields), fields)
         return self._estimate(model, _flow.estimate_input(body))
 
     def _estimate(self, model_id: str, body: Mapping[str, Any]) -> Price:
@@ -520,7 +520,7 @@ class Client:
         slot_wait: float,
     ) -> Job:
         kind = self._kind(model)
-        body = build_body(model, kind, fields.pop("prompt", None) if prompt is None else prompt, fields)
+        body = build_body(model, kind, take_prompt(prompt, fields), fields)
         pricing: Future[Price] | None = None
         pool: ThreadPoolExecutor | None = None
         if price_it or max_usd is not None:
